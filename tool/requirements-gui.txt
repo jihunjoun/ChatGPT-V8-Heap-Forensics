@@ -1,0 +1,3 @@
+# Optional: for modern dark-theme GUI (heap_forensics_gui.py)
+# If not installed, the GUI falls back to standard tkinter.
+customtkinter>=5.2.0
