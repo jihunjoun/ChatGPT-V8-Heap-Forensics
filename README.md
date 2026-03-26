@@ -5,6 +5,8 @@ Automated forensic extraction tool for recovering conversation artifacts from Ch
 This repository contains the tool and dataset associated with the paper:
 
 > **Forensic Analysis from Generative AI Web Application Memory: A ChatGPT Case Study**
+>
+> Jihun Joun, School of Interdisciplinary Forensics, Arizona State University
 
 ## Overview
 
@@ -56,9 +58,13 @@ pip install -r requirements-gui.txt
 python heap_forensics_app.py
 ```
 
-Or run `heap_forensics_app.py` without arguments to launch the GUI directly. Pass a `.heapsnapshot` path as the first argument to run in CLI mode.
+Run `heap_forensics_app.py` without arguments to launch the GUI. Pass a `.heapsnapshot` path as the first argument to run in CLI mode instead.
 
-For detailed GUI instructions, see [README-GUI.md](README-GUI.md).
+**GUI Workflow:**
+1. Click **Browse...** to select a `.heapsnapshot` file
+2. Optionally change the output folder
+3. Click **Analyze** to run the extraction
+4. Use the result buttons to open conversation threads, structure report, or the output folder
 
 ## Output
 
@@ -71,10 +77,10 @@ The tool produces four output files:
 
 ## How It Works
 
-1. **Graph Reconstruction**: Parses the `.heapsnapshot` file and reconstructs the directed object graph by interpreting the metadata schema and decoding node/edge arrays
-2. **Adaptive Signature Scan**: Scans all object nodes in the heap for the structural signature of conversation data — specifically, objects possessing the four required properties: `id`, `parentId`, `children`, and `message`. This approach does not rely on any fixed container path (e.g., WeakMap), making it resilient to application refactors
-3. **Data Extraction**: For each matched object, extracts message content (via `message → content → parts`), author role, creation timestamp, and metadata including search queries, content references, and image generation parameters
-4. **Thread Reconstruction**: Traces `parentId` and `children` fields to reconstruct the original conversation flow and branching structure, including regenerated responses
+1. **Graph Reconstruction** — Parses the `.heapsnapshot` file and reconstructs the directed object graph by interpreting the metadata schema and decoding node/edge arrays
+2. **Adaptive Signature Scan** — Scans all object nodes in the heap for the structural signature of conversation data, specifically objects possessing the four required properties: `id`, `parentId`, `children`, and `message`. This approach does not rely on any fixed container path (e.g., WeakMap), making it resilient to application refactors
+3. **Data Extraction** — For each matched object, extracts message content (via `message → content → parts`), author role, creation timestamp, and metadata including search queries, content references, and image generation parameters
+4. **Thread Reconstruction** — Traces `parentId` and `children` fields to reconstruct the original conversation flow and branching structure, including regenerated responses
 
 ## Extracted Artifacts
 
