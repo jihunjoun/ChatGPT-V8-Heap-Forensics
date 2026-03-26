@@ -1,18 +1,33 @@
 # -*- coding: utf-8 -*-
 """
 Heap Snapshot parser: WeakMap -> table, only nodes with id/parentId/children/message.
-Generates structure_report.html and conversation_threads.html.
+Generates structure_report.html, conversation_threads.html/json, and a forensic_run_summary.txt.
 """
 
+import hashlib
 import json
 import os
+import platform
 import re
 import sys
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 
 NODE_FIELD_COUNT = 6
 EDGE_FIELD_COUNT = 3
 UUID_PATTERN = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+# Synthetic root id shared across conversation branches in the ChatGPT client (many wrapper instances may exist in the heap).
+CLIENT_CREATED_ROOT = "client-created-root"
+# Structure report — message property subtree depth: base + extra depth for content/metadata.
+STRUCTURE_MESSAGE_PROP_DEPTH = 2
+STRUCTURE_MESSAGE_CONTENT_EXTRA_DEPTH = 1
+STRUCTURE_MESSAGE_METADATA_EXTRA_DEPTH = 2
+STRUCTURE_MESSAGE_PROPS_FIRST = ("author", "create_time", "content", "metadata")
+# Depth under the wrapper's `children` property node (+1 hop vs earlier default).
+STRUCTURE_WRAPPER_CHILDREN_DEPTH = 2
+
+TOOL_VERSION = "1.0"
+FORENSIC_RUN_SUMMARY_FILENAME = "forensic_run_summary.txt"
 
 
 def contains_uuid(s: str) -> bool:
@@ -255,14 +270,48 @@ def get_property_number(snapshot: dict, obj_index: int, prop_name: str, edge_off
         return None
 
 
-def get_children_ids_from_message(snapshot: dict, message_node_index: int, edge_offsets: list[int] | None) -> list[str]:
-    """Return list of id strings from each element (object) of the message's children array."""
-    children_idx = get_property_node(snapshot, message_node_index, "children", edge_offsets)
+def get_children_ids_from_owner(snapshot: dict, owner_node_index: int, edge_offsets: list[int] | None) -> list[str]:
+    """Resolve child message ids from `children` on a conversation wrapper or legacy message node.
+
+    - Legacy: `children` is an array of objects each with `.id`.
+    - ChatGPT 5.x style: `children` is an object with internal `elements` array of UUID strings,
+      or numeric element edges directly to string nodes.
+    """
+    children_idx = get_property_node(snapshot, owner_node_index, "children", edge_offsets)
     if children_idx is None:
         return []
     node = get_node(snapshot, children_idx)
-    if node.get("type") != "array" and node.get("type") != "object":
+    ct = node.get("type")
+    if ct not in ("array", "object"):
         return []
+
+    if ct == "object":
+        elements_idx = get_property_node(snapshot, children_idx, "elements", edge_offsets)
+        if elements_idx is not None and get_node(snapshot, elements_idx).get("type") == "array":
+            parts = _collect_array_strings(snapshot, elements_idx, edge_offsets)
+            return [x.strip() for x in parts if x and str(x).strip()]
+        ids: list[str] = []
+        seen: set[str] = set()
+        for e in get_edges_from_node(snapshot, children_idx, edge_offsets):
+            lab = str(e.get("label", "")).strip()
+            if not lab.isdigit():
+                continue
+            child_idx = e["to_node_index"]
+            child_node = get_node(snapshot, child_idx)
+            t = child_node.get("type") or ""
+            if t in ("string", "hidden", "concatenated string", "sliced string", "synthetic"):
+                s = _node_name_as_string(snapshot, child_node)
+                if s and s.strip() and s not in seen:
+                    seen.add(s)
+                    ids.append(s.strip())
+            elif t == "object":
+                sid = get_property_string(snapshot, child_idx, "id", edge_offsets)
+                if sid and sid not in seen:
+                    seen.add(sid)
+                    ids.append(sid)
+        if ids:
+            return ids
+
     ids = []
     for e in get_edges_from_node(snapshot, children_idx, edge_offsets):
         child_idx = e["to_node_index"]
@@ -273,6 +322,11 @@ def get_children_ids_from_message(snapshot: dict, message_node_index: int, edge_
         if sid:
             ids.append(sid)
     return ids
+
+
+def get_children_ids_from_message(snapshot: dict, message_node_index: int, edge_offsets: list[int] | None) -> list[str]:
+    """Return child message ids from the message node's `children` (same resolution as conversation wrapper)."""
+    return get_children_ids_from_owner(snapshot, message_node_index, edge_offsets)
 
 
 def get_author_role(snapshot: dict, message_node_index: int, edge_offsets: list[int] | None) -> str:
@@ -374,7 +428,7 @@ def get_all_text_from_message_parts(
     if parts_idx is None:
         return result
 
-    # parts 배열의 각 요소(0,1,2,...)를 인덱스 순서로 순회
+    # Walk parts[0], parts[1], ... in numeric index order.
     edges = get_edges_from_node(snapshot, parts_idx, edge_offsets)
     indexed_parts: list[tuple[int, int]] = []
     for e in edges:
@@ -388,7 +442,7 @@ def get_all_text_from_message_parts(
     indexed_parts.sort(key=lambda x: x[0])
 
     for _idx, part_idx in indexed_parts:
-        # 1) part.text 배열이 직접 있는 경우
+        # 1) part.text array present
         text_node = get_property_node(snapshot, part_idx, "text", edge_offsets)
         if text_node is not None:
             node = get_node(snapshot, text_node)
@@ -401,14 +455,14 @@ def get_all_text_from_message_parts(
                     result.append(s.strip())
             continue
 
-        # 2) part.elements[*].text[*] 구조를 사용하는 경우 (폴백)
+        # 2) Fallback: part.elements[*].text[*] style structure
         elements_idx = get_property_node(snapshot, part_idx, "elements", edge_offsets)
         if elements_idx is not None:
             part_strings = _collect_array_strings(snapshot, elements_idx, edge_offsets)
             result.extend(part_strings)
             continue
 
-        # 3) 그래도 없으면 part 객체에서 첫 문자열 / 이름을 사용 (최후의 폴백)
+        # 3) Last resort: first string / name on the part object
         s = _first_string_from_object(snapshot, part_idx, edge_offsets)
         if s:
             result.append(s)
@@ -515,11 +569,7 @@ def get_tool_metadata_summary(
     # metadata.search_result_groups -> array of { domain, entries } (V8 may store as .elements)
     srg_idx = get_property_node(snapshot, meta_idx, "search_result_groups", edge_offsets)
     if srg_idx is not None:
-        groups_array = get_property_node(snapshot, srg_idx, "elements", edge_offsets)
-        if groups_array is None:
-            groups_array = srg_idx
-        for e in get_edges_from_node(snapshot, groups_array, edge_offsets):
-            group_idx = e["to_node_index"]
+        for _, group_idx in _iter_array_like_children(snapshot, srg_idx, edge_offsets):
             group_node = get_node(snapshot, group_idx)
             if group_node.get("type") not in ("object", "array"):
                 continue
@@ -528,17 +578,26 @@ def get_tool_metadata_summary(
             entries_idx = get_property_node(snapshot, group_idx, "entries", edge_offsets)
             entries = []
             if entries_idx is not None:
-                entries_array = get_property_node(snapshot, entries_idx, "elements", edge_offsets)
-                if entries_array is None:
-                    entries_array = entries_idx
-                for e2 in get_edges_from_node(snapshot, entries_array, edge_offsets):
-                    ent_idx = e2["to_node_index"]
+                for _, ent_idx in _iter_array_like_children(snapshot, entries_idx, edge_offsets):
                     ent_props = _get_object_string_props(snapshot, ent_idx, edge_offsets)
                     title = ent_props.get("title") or _get_property_string_or_name(snapshot, ent_idx, "title", edge_offsets) or ""
                     url = ent_props.get("url") or _get_property_string_or_name(snapshot, ent_idx, "url", edge_offsets) or ""
                     snippet = ent_props.get("snippet") or _get_property_string_or_name(snapshot, ent_idx, "snippet", edge_offsets) or ""
-                    entries.append({"title": title, "url": url, "snippet": snippet.strip()})
-            result["search_result_groups"].append({"domain": domain, "entries": entries})
+                    attr = ent_props.get("attribution") or get_property_string(snapshot, ent_idx, "attribution", edge_offsets) or ""
+                    if not any(
+                        ((title or "").strip(), (url or "").strip(), (snippet or "").strip(), (attr or "").strip())
+                    ):
+                        continue
+                    entries.append(
+                        {
+                            "title": title,
+                            "url": url,
+                            "snippet": (snippet or "").strip(),
+                            "attribution": (attr or "").strip(),
+                        }
+                    )
+            if domain or entries:
+                result["search_result_groups"].append({"domain": domain, "entries": entries})
     return result
 
 
@@ -986,8 +1045,149 @@ def write_tree_depth_n(f, node: dict) -> None:
     f.write("\n</details></li>")
 
 
-# 세션 구분: 연속 메시지 간 시간 간격이 이 값(초)을 넘으면 새 세션으로 분리
-SESSION_GAP_SECONDS = 30 * 60  # 30분
+def get_entry_message_id_for_threading(snapshot: dict, entry: tuple, edge_offsets: list[int] | None) -> str | None:
+    """message.id inside a wrapper entry (for thread assignment)."""
+    if len(entry) < 3:
+        return None
+    widx = entry[2]["node_index"]
+    msg_idx = get_property_node(snapshot, widx, "message", edge_offsets)
+    if msg_idx is None:
+        return None
+    return get_property_string(snapshot, msg_idx, "id", edge_offsets)
+
+
+def _structure_depth_for_message_prop(prop: str) -> int:
+    d = STRUCTURE_MESSAGE_PROP_DEPTH
+    if prop == "content":
+        return d + STRUCTURE_MESSAGE_CONTENT_EXTRA_DEPTH
+    if prop == "metadata":
+        return d + STRUCTURE_MESSAGE_METADATA_EXTRA_DEPTH
+    return d
+
+
+def _collect_message_property_children(snapshot: dict, msg_idx: int, edge_offsets: list[int] | None) -> list[tuple[str, int]]:
+    """(property label, child node_index) pairs for a message object; STRUCTURE_MESSAGE_PROPS_FIRST first, then alphabetical."""
+    by_label: dict[str, int] = {}
+    for e in get_edges_from_node(snapshot, msg_idx, edge_offsets):
+        if e.get("type") not in ("property", "internal"):
+            continue
+        lab = str(e.get("label", "")).strip()
+        if not lab:
+            continue
+        cidx = e["to_node_index"]
+        if lab not in by_label:
+            by_label[lab] = cidx
+    out: list[tuple[str, int]] = []
+    for p in STRUCTURE_MESSAGE_PROPS_FIRST:
+        if p in by_label:
+            out.append((p, by_label.pop(p)))
+    for lab in sorted(by_label.keys()):
+        out.append((lab, by_label[lab]))
+    return out
+
+
+def write_message_core_subtree_html(
+    f,
+    snapshot: dict,
+    msg_idx: int,
+    edge_offsets: list[int] | None,
+) -> None:
+    """Message node: render all properties; content/metadata get extra depth."""
+    msg_node = get_node(snapshot, msg_idx)
+    f.write("<li><details>\n<summary class=\"node\">")
+    f.write(
+        node_summary_html(
+            msg_node,
+            {"type": "property", "label": "message"},
+        )
+    )
+    f.write("</summary>\n<ul class=\"tree\">")
+    for prop, pidx in _collect_message_property_children(snapshot, msg_idx, edge_offsets):
+        depth = _structure_depth_for_message_prop(prop)
+        subtree = build_depth_n_tree(snapshot, pidx, depth, edge_offsets)
+        subtree["edge_from_parent"] = {"type": "property", "label": prop}
+        write_tree_depth_n(f, subtree)
+    f.write("</ul>\n</details></li>")
+
+
+def write_structure_report_wrapper_subtree(
+    f,
+    snapshot: dict,
+    wrapper_idx: int,
+    edge_offsets: list[int] | None,
+) -> None:
+    """Wrapper to depth 1: full rules for `message`, deeper for `children`, depth 1 for other properties."""
+    f.write('<ul class="tree">')
+    wtree = build_depth_n_tree(snapshot, wrapper_idx, 1, edge_offsets)
+    for ch in wtree.get("children", []):
+        edge = ch.get("edge_from_parent") or {}
+        lab = str(edge.get("label", "")).strip().lower()
+        if lab == "message":
+            write_message_core_subtree_html(f, snapshot, ch["node_index"], edge_offsets)
+        elif lab == "children":
+            sub = build_depth_n_tree(snapshot, ch["node_index"], STRUCTURE_WRAPPER_CHILDREN_DEPTH, edge_offsets)
+            sub["edge_from_parent"] = edge
+            write_tree_depth_n(f, sub)
+        else:
+            write_tree_depth_n(f, ch)
+    f.write("</ul>")
+
+
+def _structure_thread_section_title(comp: list[dict]) -> str:
+    """Section title from stem id (direct under root) or first id in the component."""
+    for m in comp:
+        if m.get("id") and (m.get("parentId") or "").strip() == CLIENT_CREATED_ROOT:
+            return str(m["id"])
+    if comp and comp[0].get("id"):
+        return str(comp[0]["id"])
+    return "thread"
+
+
+def _partition_structure_report_entries(
+    snapshot: dict, uuid_entries: list, edge_offsets: list[int] | None
+) -> tuple[list[int], list[list], list, list[list[dict]]]:
+    """Partition entries by thread for structure_report HTML."""
+    if not uuid_entries:
+        return [], [], [], []
+    all_msgs = collect_unique_message_records_from_entries(snapshot, uuid_entries, edge_offsets)
+    components = cluster_messages_into_threads(all_msgs)
+    mid_to_thread: dict[str, int] = {}
+    for ti, comp in enumerate(components):
+        for m in comp:
+            if m.get("id"):
+                mid_to_thread[m["id"]] = ti
+    thread_entries: list[list] = [[] for _ in components]
+    orphan_entries: list = []
+    for ent in uuid_entries:
+        mid = get_entry_message_id_for_threading(snapshot, ent, edge_offsets)
+        if mid and mid in mid_to_thread:
+            thread_entries[mid_to_thread[mid]].append(ent)
+        else:
+            orphan_entries.append(ent)
+    thread_order = sorted(
+        range(len(components)),
+        key=lambda i: _component_latest_ts(components[i]) if components[i] else 0.0,
+        reverse=True,
+    )
+    return thread_order, thread_entries, orphan_entries, components
+
+
+def _structure_entry_extracted_text(snapshot: dict, entry: tuple, edge_offsets: list[int] | None) -> str | None:
+    if len(entry) < 5 or entry[4] is None:
+        return None
+    msg_parts_elements = entry[4]
+    path_chain, elements_tree = msg_parts_elements
+    msg_idx = path_chain[0][0]["node_index"] if path_chain else None
+    text_parts: list[str] = []
+    if msg_idx is not None:
+        text_parts.extend(get_all_text_from_message_parts(snapshot, msg_idx, edge_offsets))
+    if elements_tree:
+        text_parts.extend(collect_strings_from_elements_tree(elements_tree))
+    text, media_summary = _parse_content_parts(text_parts, "unknown")
+    if media_summary:
+        text = (text + " " + media_summary).strip() if text else media_summary
+    t = (text or "").strip()
+    return t if t else None
 
 
 def _parse_create_time_to_ts(raw: str | None) -> float | None:
@@ -1013,27 +1213,6 @@ def _parse_create_time_to_ts(raw: str | None) -> float | None:
     except (ValueError, OSError):
         pass
     return None
-
-
-def _split_ordered_messages_into_sessions(
-    ordered: list[dict], gap_seconds: float = SESSION_GAP_SECONDS
-) -> list[list[dict]]:
-    """Ordered 메시지 리스트를 시간 간격으로 세션 단위로 나눔. gap 초과 시 새 세션."""
-    if not ordered:
-        return []
-    sessions: list[list[dict]] = []
-    current: list[dict] = [ordered[0]]
-    prev_ts = _parse_create_time_to_ts(ordered[0].get("create_time"))
-    for m in ordered[1:]:
-        ts = _parse_create_time_to_ts(m.get("create_time"))
-        if prev_ts is not None and ts is not None and (ts - prev_ts) > gap_seconds:
-            sessions.append(current)
-            current = [m]
-        else:
-            current.append(m)
-        prev_ts = ts if ts is not None else prev_ts
-    sessions.append(current)
-    return sessions
 
 
 def _format_display_time(raw: str | None) -> str:
@@ -1064,6 +1243,484 @@ def _format_display_time(raw: str | None) -> str:
     return raw
 
 
+def _indexed_children_sorted(
+    snapshot: dict, parent_idx: int, edge_offsets: list[int] | None
+) -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = []
+    for e in get_edges_from_node(snapshot, parent_idx, edge_offsets):
+        lab = str(e.get("label", "")).strip()
+        if lab.isdigit():
+            pairs.append((int(lab), e["to_node_index"]))
+    pairs.sort(key=lambda x: x[0])
+    return pairs
+
+
+def _iter_array_like_children(
+    snapshot: dict, parent_idx: int, edge_offsets: list[int] | None
+) -> list[tuple[int, int]]:
+    """Children indexed 0,1,... — either a true array node or object.parts.elements (V8 heap)."""
+    n = get_node(snapshot, parent_idx)
+    nt = (n.get("type") or "").lower()
+    if nt == "array":
+        return _indexed_children_sorted(snapshot, parent_idx, edge_offsets)
+    el = get_property_node(snapshot, parent_idx, "elements", edge_offsets)
+    if el is not None and (get_node(snapshot, el).get("type") or "").lower() == "array":
+        return _indexed_children_sorted(snapshot, el, edge_offsets)
+    return _indexed_children_sorted(snapshot, parent_idx, edge_offsets)
+
+
+def _extract_content_flat_text(snapshot: dict, content_idx: int, edge_offsets: list[int] | None) -> str | None:
+    """message.content.text as a string or concatenated array elements."""
+    text_idx = get_property_node(snapshot, content_idx, "text", edge_offsets)
+    if text_idx is None:
+        return None
+    node = get_node(snapshot, text_idx)
+    t = (node.get("type") or "").lower()
+    if t in ("array", "object"):
+        parts = _collect_array_strings(snapshot, text_idx, edge_offsets)
+        return "\n".join(parts) if parts else None
+    s = _node_name_as_string(snapshot, node)
+    if s:
+        return s
+    return get_property_string(snapshot, content_idx, "text", edge_offsets)
+
+
+def _extract_message_parts_detail(
+    snapshot: dict, parts_idx: int, edge_offsets: list[int] | None
+) -> list[dict]:
+    """message.content.parts[n]: height, width, size_bytes, string, metadata.*."""
+    out: list[dict] = []
+    for i, part_idx in _iter_array_like_children(snapshot, parts_idx, edge_offsets):
+        row: dict = {"index": i}
+        pn = get_node(snapshot, part_idx)
+        pt = (pn.get("type") or "").lower()
+        if pt in ("string", "concatenated string", "sliced string", "hidden"):
+            s0 = _node_name_as_string(snapshot, pn)
+            if s0:
+                row["string"] = s0
+        for prop in ("height", "width", "size_bytes"):
+            v = get_property_number(snapshot, part_idx, prop, edge_offsets)
+            if v is not None:
+                row[prop] = v
+        s = get_property_string(snapshot, part_idx, "string", edge_offsets)
+        if s:
+            row["string"] = s
+        if "string" not in row and get_property_node(snapshot, part_idx, "string", edge_offsets) is None:
+            if pt == "string":
+                ns = _node_name_as_string(snapshot, pn)
+                if ns:
+                    row["string"] = ns
+        meta_idx = get_property_node(snapshot, part_idx, "metadata", edge_offsets)
+        if meta_idx is not None:
+            md: dict = {}
+            d_idx = get_property_node(snapshot, meta_idx, "dalle", edge_offsets)
+            if d_idx is not None:
+                gid = get_property_string(snapshot, d_idx, "gen_id", edge_offsets)
+                if gid:
+                    md["dalle"] = {"gen_id": gid}
+            gen_idx = get_property_node(snapshot, meta_idx, "generation", edge_offsets)
+            if gen_idx is not None:
+                gid = get_property_string(snapshot, gen_idx, "gen_id", edge_offsets)
+                if gid:
+                    md["generation"] = {"gen_id": gid}
+            san = get_property_string(snapshot, meta_idx, "sanitized", edge_offsets)
+            if san:
+                md["sanitized"] = san
+            if md:
+                row["metadata"] = md
+        out.append(row)
+    return out
+
+
+def _extract_attachments_list(snapshot: dict, meta_idx: int, edge_offsets: list[int] | None) -> list[dict]:
+    att_idx = get_property_node(snapshot, meta_idx, "attachments", edge_offsets)
+    if att_idx is None:
+        return []
+    rows: list[dict] = []
+    for _, node_idx in _iter_array_like_children(snapshot, att_idx, edge_offsets):
+        item: dict = {}
+        for k in ("height", "width", "size", "id", "name", "source"):
+            if k in ("height", "width", "size"):
+                v = get_property_number(snapshot, node_idx, k, edge_offsets)
+            else:
+                v = get_property_string(snapshot, node_idx, k, edge_offsets)
+            if v is not None and v != "":
+                item[k] = v
+        props = _get_object_string_props(snapshot, node_idx, edge_offsets)
+        for k, v in props.items():
+            if k not in item and v:
+                item[k] = v
+        if item:
+            rows.append(item)
+    return rows
+
+
+def _extract_content_references_list(snapshot: dict, meta_idx: int, edge_offsets: list[int] | None) -> list[dict]:
+    cr_idx = get_property_node(snapshot, meta_idx, "content_references", edge_offsets)
+    if cr_idx is None:
+        return []
+    refs: list[dict] = []
+    children = _iter_array_like_children(snapshot, cr_idx, edge_offsets)
+    if not children:
+        return []
+    for i, ref_idx in children:
+        ref: dict = {"index": i}
+        for k in ("name", "attribution", "snippet", "title", "url"):
+            sk = get_property_string(snapshot, ref_idx, k, edge_offsets)
+            if sk:
+                ref[k] = sk
+        props = _get_object_string_props(snapshot, ref_idx, edge_offsets)
+        for k, v in props.items():
+            if k not in ref and v:
+                ref[k] = v
+        items_idx = get_property_node(snapshot, ref_idx, "items", edge_offsets)
+        if items_idx is not None:
+            item_pairs = _iter_array_like_children(snapshot, items_idx, edge_offsets)
+            items: list[dict] = []
+            for j, it_idx in item_pairs:
+                it: dict = {"index": j}
+                for k in ("attribution", "snippet", "title", "url"):
+                    sk = get_property_string(snapshot, it_idx, k, edge_offsets)
+                    if sk:
+                        it[k] = sk
+                ip = _get_object_string_props(snapshot, it_idx, edge_offsets)
+                for k in ("attribution", "snippet", "title", "url"):
+                    if k in ip and k not in it:
+                        it[k] = ip[k]
+                if len(it) > 1:
+                    items.append(it)
+            if items:
+                ref["items"] = items
+        refs.append(ref)
+    return refs
+
+
+def _extract_safe_urls_list(snapshot: dict, meta_idx: int, edge_offsets: list[int] | None) -> list[str]:
+    su_idx = get_property_node(snapshot, meta_idx, "safe_urls", edge_offsets)
+    if su_idx is None:
+        return []
+    node = get_node(snapshot, su_idx)
+    if (node.get("type") or "").lower() in ("array", "object"):
+        return [x for x in _collect_array_strings(snapshot, su_idx, edge_offsets) if x]
+    s = get_property_string(snapshot, meta_idx, "safe_urls", edge_offsets)
+    return [s] if s else []
+
+
+def _extract_search_result_groups_enriched(snapshot: dict, meta_idx: int, edge_offsets: list[int] | None) -> list[dict]:
+    """Like get_tool_metadata search groups, but include attribution on each entry."""
+    result: list[dict] = []
+    srg_idx = get_property_node(snapshot, meta_idx, "search_result_groups", edge_offsets)
+    if srg_idx is None:
+        return result
+    group_pairs = _iter_array_like_children(snapshot, srg_idx, edge_offsets)
+    if not group_pairs:
+        return result
+    for _, group_idx in group_pairs:
+        group_node = get_node(snapshot, group_idx)
+        if group_node.get("type") not in ("object", "array"):
+            continue
+        props = _get_object_string_props(snapshot, group_idx, edge_offsets)
+        domain = props.get("domain") or _get_property_string_or_name(snapshot, group_idx, "domain", edge_offsets) or ""
+        entries_idx = get_property_node(snapshot, group_idx, "entries", edge_offsets)
+        entries: list[dict] = []
+        if entries_idx is not None:
+            for _, ent_idx in _iter_array_like_children(snapshot, entries_idx, edge_offsets):
+                ent_props = _get_object_string_props(snapshot, ent_idx, edge_offsets)
+                title = ent_props.get("title") or _get_property_string_or_name(snapshot, ent_idx, "title", edge_offsets) or ""
+                url = ent_props.get("url") or _get_property_string_or_name(snapshot, ent_idx, "url", edge_offsets) or ""
+                snippet = ent_props.get("snippet") or _get_property_string_or_name(snapshot, ent_idx, "snippet", edge_offsets) or ""
+                attr = ent_props.get("attribution") or get_property_string(snapshot, ent_idx, "attribution", edge_offsets) or ""
+                if not any(
+                    ((title or "").strip(), (url or "").strip(), (snippet or "").strip(), (attr or "").strip())
+                ):
+                    continue
+                entries.append(
+                    {
+                        "title": title.strip(),
+                        "url": url.strip(),
+                        "snippet": snippet.strip(),
+                        "attribution": attr.strip(),
+                    }
+                )
+        if domain or entries:
+            result.append({"domain": domain, "entries": entries})
+    return result
+
+
+def extract_conversation_message_extra(
+    snapshot: dict, msg_node_index: int, edge_offsets: list[int] | None
+) -> dict:
+    """Structured fields for conversation report: parts, metadata, code block text."""
+    out: dict = {}
+    content_idx = get_property_node(snapshot, msg_node_index, "content", edge_offsets)
+    content_type = None
+    code_block_text = None
+    if content_idx is not None:
+        content_type = get_property_string(snapshot, content_idx, "content_type", edge_offsets)
+        if (content_type or "").strip().lower() == "code":
+            t = _extract_content_flat_text(snapshot, content_idx, edge_offsets)
+            if t and t.strip():
+                code_block_text = t.strip()
+        parts_idx = get_property_node(snapshot, content_idx, "parts", edge_offsets)
+        if parts_idx is not None:
+            parts = _extract_message_parts_detail(snapshot, parts_idx, edge_offsets)
+            if parts:
+                out["parts"] = parts
+    if content_type:
+        out["content_type"] = content_type
+    if code_block_text:
+        out["code_block_text"] = code_block_text
+
+    meta_idx = get_property_node(snapshot, msg_node_index, "metadata", edge_offsets)
+    if meta_idx is not None:
+        mm: dict = {}
+        for key in ("model_slug", "image_gen_title", "resolved_model_slug"):
+            v = get_property_string(snapshot, meta_idx, key, edge_offsets)
+            if v and v.strip():
+                mm[key] = v.strip()
+        att = _extract_attachments_list(snapshot, meta_idx, edge_offsets)
+        if att:
+            mm["attachments"] = att
+        cr_idx = get_property_node(snapshot, meta_idx, "content_references", edge_offsets)
+        cr = _extract_content_references_list(snapshot, meta_idx, edge_offsets)
+        if cr:
+            mm["content_references"] = cr
+        if cr_idx is not None:
+            cr_root_name = get_property_string(snapshot, cr_idx, "name", edge_offsets)
+            if cr_root_name and cr_root_name.strip():
+                mm["content_references_name"] = cr_root_name.strip()
+        su = _extract_safe_urls_list(snapshot, meta_idx, edge_offsets)
+        if su:
+            mm["safe_urls"] = su
+        srg = _extract_search_result_groups_enriched(snapshot, meta_idx, edge_offsets)
+        if srg:
+            mm["search_result_groups"] = srg
+        if mm:
+            out["message_metadata"] = mm
+    return out
+
+
+def _prune_empty_extra(extra: dict) -> dict:
+    if not extra:
+        return {}
+    cleaned: dict = {}
+    for k, v in extra.items():
+        if v is None:
+            continue
+        if isinstance(v, dict) and not v:
+            continue
+        if isinstance(v, list) and not v:
+            continue
+        if isinstance(v, str) and not str(v).strip():
+            continue
+        cleaned[k] = v
+    return cleaned
+
+
+def _merge_part_dicts(a: dict, b: dict) -> dict:
+    out = dict(a)
+    for k, v in b.items():
+        if k not in out or out[k] in (None, ""):
+            out[k] = v
+    return out
+
+
+def _merge_conversation_extra_dict(a: dict | None, b: dict | None) -> dict | None:
+    if not a:
+        return b if b else None
+    if not b:
+        return a if a else None
+    out = dict(a)
+    for k, v in b.items():
+        if k not in out or out[k] in (None, "", [], {}):
+            out[k] = v
+        elif k == "parts" and isinstance(v, list) and isinstance(out.get("parts"), list):
+            op, vp = out["parts"], v
+            if len(vp) > len(op):
+                out["parts"] = vp
+            else:
+                merged_parts = []
+                for i in range(max(len(op), len(vp))):
+                    pa = op[i] if i < len(op) else {}
+                    pb = vp[i] if i < len(vp) else {}
+                    merged_parts.append(_merge_part_dicts(pa, pb))
+                out["parts"] = merged_parts
+        elif k == "message_metadata" and isinstance(v, dict) and isinstance(out.get("message_metadata"), dict):
+            merged = {**out["message_metadata"], **v}
+            out["message_metadata"] = merged
+    return out
+
+
+def _merge_message_records(prev: dict, new: dict) -> dict:
+    """Combine two records for the same message id (different heap paths)."""
+    out = dict(prev)
+    if len((new.get("content") or "").strip()) > len((out.get("content") or "").strip()):
+        out["content"] = new["content"]
+    for k in ("tool_label_suffix", "tool_metadata"):
+        if new.get(k) and not out.get(k):
+            out[k] = new[k]
+    ncode = (new.get("assistant_code_reasoning") or "").strip()
+    ocode = (out.get("assistant_code_reasoning") or "").strip()
+    if ncode and (not ocode or len(ncode) > len(ocode)):
+        out["assistant_code_reasoning"] = new["assistant_code_reasoning"]
+    merged_extra = _merge_conversation_extra_dict(prev.get("conversation_extra"), new.get("conversation_extra"))
+    if merged_extra:
+        out["conversation_extra"] = merged_extra
+    return out
+
+
+def _parts_have_heap_forensics_value(parts: list) -> bool:
+    """True if at least one part has text, image metrics, or part-level metadata (skip index-only noise)."""
+    for p in parts:
+        if not isinstance(p, dict):
+            continue
+        s = p.get("string")
+        if s is not None and str(s).strip():
+            return True
+        for k in ("height", "width", "size_bytes"):
+            v = p.get(k)
+            if v is not None and v != "":
+                return True
+        md = p.get("metadata")
+        if isinstance(md, dict) and md:
+            return True
+    return False
+
+
+def _search_result_groups_have_value(groups: list) -> bool:
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        if str(g.get("domain") or "").strip():
+            return True
+        for ent in g.get("entries") or []:
+            if not isinstance(ent, dict):
+                continue
+            if any(
+                str(ent.get(k) or "").strip()
+                for k in ("title", "url", "snippet", "attribution")
+            ):
+                return True
+    return False
+
+
+def _conversation_extra_has_substantive_fields(extra: dict | None) -> bool:
+    """True when extra has heap fields beyond model_slug / resolved_model_slug / content_type alone."""
+    if not extra:
+        return False
+    mm = extra.get("message_metadata") or {}
+    parts = extra.get("parts") or []
+    if parts and _parts_have_heap_forensics_value(parts):
+        return True
+    if mm.get("attachments"):
+        return True
+    if mm.get("content_references"):
+        return True
+    if mm.get("safe_urls"):
+        return True
+    if mm.get("content_references_name"):
+        return True
+    if mm.get("search_result_groups") and _search_result_groups_have_value(mm["search_result_groups"]):
+        return True
+    if (mm.get("image_gen_title") or "").strip():
+        return True
+    return False
+
+
+def _html_conversation_extra(extra: dict | None, include_model_slug_line: bool = True) -> str:
+    if not extra:
+        return ""
+    mm = extra.get("message_metadata") or {}
+    parts = extra.get("parts") or []
+    blocks: list[str] = []
+    if parts and _parts_have_heap_forensics_value(parts):
+        lines = []
+        for p in parts[:80]:
+            bits = [f"part[{p.get('index', '?')}]"]
+            for k in ("height", "width", "size_bytes", "string"):
+                if k in p and p[k] is not None:
+                    bits.append(f"{k}={p[k]}")
+            meta = p.get("metadata") or {}
+            if meta:
+                bits.append("metadata=" + str(meta)[:500])
+            lines.append(" · ".join(str(b) for b in bits))
+        blocks.append(
+            '<details class="msg-extra"><summary>Heap: content.parts (extra fields only)</summary>'
+            "<pre class=\"msg-extra-pre\">" + escape_html("\n".join(lines)) + "</pre></details>"
+        )
+    if include_model_slug_line and (
+        mm.get("model_slug") or mm.get("resolved_model_slug") or mm.get("image_gen_title")
+    ):
+        bits = []
+        if mm.get("model_slug"):
+            bits.append(f"model_slug: {escape_html(mm['model_slug'])}")
+        if mm.get("resolved_model_slug"):
+            bits.append(f"resolved_model_slug: {escape_html(mm['resolved_model_slug'])}")
+        if mm.get("image_gen_title"):
+            bits.append(f"image_gen_title: {escape_html(mm['image_gen_title'])}")
+        blocks.append('<div class="msg-extra-line">' + " · ".join(bits) + "</div>")
+    if mm.get("attachments"):
+        lines = []
+        for i, a in enumerate(mm["attachments"][:50]):
+            lines.append(str(a))
+        blocks.append(
+            "<details class=\"msg-extra\"><summary>Attachments</summary><pre class=\"msg-extra-pre\">"
+            + escape_html("\n".join(lines))
+            + "</pre></details>"
+        )
+    if mm.get("content_references"):
+        lines = []
+        for cr in mm["content_references"][:40]:
+            lines.append(str(cr))
+        blocks.append(
+            "<details class=\"msg-extra\"><summary>Content references</summary><pre class=\"msg-extra-pre\">"
+            + escape_html("\n".join(lines))
+            + "</pre></details>"
+        )
+    if mm.get("content_references_name"):
+        blocks.append(
+            '<div class="msg-extra-line">content_references.name: '
+            + escape_html(mm["content_references_name"])
+            + "</div>"
+        )
+    if mm.get("safe_urls"):
+        blocks.append(
+            "<details class=\"msg-extra\"><summary>Safe URLs</summary><pre class=\"msg-extra-pre\">"
+            + escape_html("\n".join(mm["safe_urls"][:100]))
+            + "</pre></details>"
+        )
+    if mm.get("search_result_groups") and _search_result_groups_have_value(mm["search_result_groups"]):
+        lines = []
+        for g in mm["search_result_groups"][:25]:
+            dom = g.get("domain") or ""
+            lines.append(f"[{dom}]")
+            for ent in (g.get("entries") or [])[:20]:
+                lines.append(
+                    "  "
+                    + (ent.get("title") or "")
+                    + " | "
+                    + (ent.get("url") or "")
+                    + " | "
+                    + (ent.get("attribution") or "")
+                )
+        blocks.append(
+            "<details class=\"msg-extra\"><summary>Search result groups</summary><pre class=\"msg-extra-pre\">"
+            + escape_html("\n".join(lines))
+            + "</pre></details>"
+        )
+    if not blocks:
+        return ""
+    return '<div class="msg-extra-wrap">' + "".join(blocks) + "</div>"
+
+
+def _html_assistant_code_reasoning(text: str) -> str:
+    return (
+        '<div class="msg-code-reasoning">'
+        '<div class="msg-code-reasoning-label">Assistant internal reasoning (code)</div>'
+        '<pre class="msg-code-reasoning-body">' + escape_html(text) + "</pre></div>"
+    )
+
+
 def _build_message_record(
     snapshot: dict,
     msg_node_index: int,
@@ -1076,16 +1733,15 @@ def _build_message_record(
     Prefer full message.content.parts[*].text[*] so that long messages spanning multiple parts are not truncated."""
     role = get_author_role(snapshot, msg_node_index, edge_offsets)
 
-    # 1순위: message.content.parts[*].text[*] 전체를 인덱스 순으로 모음
+    # Primary: message.content.parts[*].text[*] in index order
     strings_parts = get_all_text_from_message_parts(snapshot, msg_node_index, edge_offsets)
 
-    # 2순위: elements 트리 기반 수집 (이전 방식) – 일부 포맷에서는 여기에만 전체 텍스트가 있는 경우가 있으므로
+    # Secondary: elements tree (legacy); some formats only keep full text here
     strings_elements: list[str] = []
     if elements_tree:
         strings_elements = collect_strings_from_elements_tree(elements_tree)
 
-    # 두 소스를 모두 합쳐서 사용 (순서를 보장하기 위해 단순 이어붙이기).
-    # 약간의 중복은 허용하고, 실제 텍스트 정리는 _parse_content_parts 에 맡긴다.
+    # Concatenate both sources in order; allow mild duplication, normalize in _parse_content_parts.
     strings = []
     if strings_parts:
         strings.extend(strings_parts)
@@ -1110,10 +1766,18 @@ def _build_message_record(
     else:
         if media_summary:
             content = (content + " " + media_summary).strip() if content else media_summary
+    graph_owner_idx = object_node_index if object_node_index is not None else msg_node_index
+    parent_id = get_property_string(snapshot, graph_owner_idx, "parentId", edge_offsets)
+    if not (parent_id or "").strip():
+        parent_id = get_property_string(snapshot, msg_node_index, "parentId", edge_offsets)
+    child_ids = get_children_ids_from_owner(snapshot, graph_owner_idx, edge_offsets)
+    if not child_ids:
+        child_ids = get_children_ids_from_owner(snapshot, msg_node_index, edge_offsets)
+
     rec = {
         "id": get_property_string(snapshot, msg_node_index, "id", edge_offsets),
-        "parentId": get_property_string(snapshot, msg_node_index, "parentId", edge_offsets),
-        "children": get_children_ids_from_message(snapshot, msg_node_index, edge_offsets),
+        "parentId": parent_id,
+        "children": child_ids,
         "role": role,
         "create_time": get_create_time_value(snapshot, msg_node_index, edge_offsets),
         "channel": get_property_string(snapshot, msg_node_index, "channel", edge_offsets),
@@ -1123,59 +1787,203 @@ def _build_message_record(
         rec["tool_label_suffix"] = tool_label_suffix
     if tool_metadata_structured is not None:
         rec["tool_metadata"] = tool_metadata_structured
+
+    conv_extra = _prune_empty_extra(extract_conversation_message_extra(snapshot, msg_node_index, edge_offsets))
+    if conv_extra:
+        rec["conversation_extra"] = conv_extra
+    ct = (conv_extra.get("content_type") or "").strip().lower()
+    if ct == "code" and conv_extra.get("code_block_text"):
+        rec["assistant_code_reasoning"] = conv_extra["code_block_text"]
+    rec["message_node_index"] = msg_node_index
     return rec
 
 
-def _get_root_id(msg: dict, by_id: dict[str, dict]) -> str | None:
-    """Walk parentId chain to find the root in by_id; return that id. If we exit the set (parent not in by_id), return None so caller can assign table-level thread."""
-    mid = msg.get("id")
-    if not mid:
+def _graph_key(m: dict) -> str:
+    """Stable key for graph algorithms when message.id duplicates (e.g. client-created-root)."""
+    mid = (m.get("id") or "").strip()
+    if mid and mid != CLIENT_CREATED_ROOT:
+        return mid
+    nix = m.get("message_node_index")
+    if nix is not None:
+        return f"__msgidx_{nix}"
+    return mid or "__unknown__"
+
+
+def _graph_key_lookup(pid: str, by_id: dict[str, dict]) -> str | None:
+    if not pid:
         return None
-    visited = set()
-    while mid:
-        if mid in visited:
-            return mid
-        visited.add(mid)
-        m = by_id.get(mid)
-        if not m:
-            return None
-        pid = (m.get("parentId") or "").strip()
-        if not pid or pid not in by_id:
-            return None
-        mid = pid
-    return mid or None
+    if pid in by_id:
+        return pid
+    for k, m in by_id.items():
+        if (m.get("id") or "").strip() == pid:
+            return k
+    return None
 
 
-def _group_messages_by_thread_root(messages: list[dict]) -> dict[str, list[dict]]:
-    """Group messages by conversation root. If parentId chain leaves our set, treat whole table as one thread (synthetic key)."""
-    by_id = {m["id"]: m for m in messages if m.get("id")}
-    if not by_id:
-        return {"": messages} if messages else {}
-    root_to_msgs: dict[str, list[dict]] = {}
-    synthetic_key = "__table_thread__"
+def _group_messages_by_message_graph(messages: list[dict]) -> list[list[dict]]:
+    """One conversation thread per connected component on id/parentId/children (child/sibling links keep threads even if a parent is outside the snapshot)."""
+    by_id: dict[str, dict] = {}
     for m in messages:
-        mid = m.get("id")
-        if not mid:
-            root_to_msgs.setdefault("", []).append(m)
+        gk = _graph_key(m)
+        if gk:
+            by_id[gk] = m
+    if not by_id:
+        return []
+    parent = {i: i for i in by_id}
+    rank = {i: 0 for i in by_id}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    for gk, m in by_id.items():
+        pid = (m.get("parentId") or "").strip()
+        pk = _graph_key_lookup(pid, by_id)
+        if pk:
+            union(gk, pk)
+        for cid in m.get("children") or []:
+            ck = _graph_key_lookup(cid, by_id)
+            if ck:
+                union(gk, ck)
+
+    buckets: dict[str, list[dict]] = {}
+    for gk in by_id:
+        r = find(gk)
+        buckets.setdefault(r, []).append(by_id[gk])
+    return list(buckets.values())
+
+
+def _stem_id_for_message(graph_key: str, by_id: dict[str, dict]) -> str | None:
+    """Stem id reached when walking up to the node whose parentId is CLIENT_CREATED_ROOT; None if the root itself."""
+    if graph_key == CLIENT_CREATED_ROOT:
+        return None
+    seen: set[str] = set()
+    cur = graph_key
+    while cur and cur in by_id and cur not in seen:
+        seen.add(cur)
+        pid = (by_id[cur].get("parentId") or "").strip()
+        if pid == CLIENT_CREATED_ROOT:
+            return cur
+        if not pid:
+            return None
+        parent_k = _graph_key_lookup(pid, by_id)
+        if not parent_k:
+            return None
+        cur = parent_k
+    return None
+
+
+def _group_messages_by_stem_id(messages: list[dict]) -> list[list[dict]]:
+    """One thread per stem (direct child of CLIENT_CREATED_ROOT); split stems even when they share the same nominal root id string."""
+    by_id: dict[str, dict] = {}
+    for m in messages:
+        gk = _graph_key(m)
+        if gk:
+            by_id[gk] = m
+    if not by_id:
+        return []
+    buckets: dict[str, list[dict]] = {}
+    for m in messages:
+        gk = _graph_key(m)
+        if not gk:
+            buckets.setdefault("__no_id__", []).append(m)
             continue
-        root_id = _get_root_id(m, by_id)
-        if root_id is None:
-            root_id = synthetic_key
-        root_to_msgs.setdefault(root_id, []).append(m)
-    return root_to_msgs
+        stem = _stem_id_for_message(gk, by_id)
+        mid_raw = (m.get("id") or "").strip()
+        if stem is not None:
+            key = stem
+        elif mid_raw == CLIENT_CREATED_ROOT:
+            kids = m.get("children") or []
+            key = kids[0] if kids else CLIENT_CREATED_ROOT
+        else:
+            key = f"__unanchored__:{gk}"
+        buckets.setdefault(key, []).append(m)
+    return list(buckets.values())
+
+
+def _has_client_created_root_anchor(messages: list[dict]) -> bool:
+    """Whether this snapshot can use stem-based splitting (older data falls back to union–find components)."""
+    for m in messages:
+        if (m.get("parentId") or "").strip() == CLIENT_CREATED_ROOT:
+            return True
+        if m.get("id") == CLIENT_CREATED_ROOT:
+            return True
+    return False
+
+
+def cluster_messages_into_threads(messages: list[dict]) -> list[list[dict]]:
+    """Prefer stems (direct under client root); if no anchor, split by id/parentId/children components."""
+    if _has_client_created_root_anchor(messages):
+        return _group_messages_by_stem_id(messages)
+    return _group_messages_by_message_graph(messages)
+
+
+def collect_unique_message_records_from_entries(
+    snapshot: dict,
+    uuid_entries: list,
+    edge_offsets: list[int] | None,
+) -> list[dict]:
+    """Collect message records from all entries, deduplicate by heap message node index (not message.id string).
+
+    Multiple wrappers can point at the same message node; message.id may be client-created-root or duplicated.
+    """
+    by_msg_idx: dict[int, dict] = {}
+    for entry in uuid_entries:
+        if len(entry) < 5 or entry[4] is None:
+            continue
+        part_of_key_child = entry[2]
+        msg_parts_elements = entry[4]
+        path_chain, elements_tree = msg_parts_elements
+        if not path_chain:
+            continue
+        msg_idx = path_chain[0][0]["node_index"]
+        obj_idx = part_of_key_child.get("node_index") if part_of_key_child else None
+        rec = _build_message_record(snapshot, msg_idx, elements_tree, edge_offsets, object_node_index=obj_idx)
+        if msg_idx not in by_msg_idx:
+            by_msg_idx[msg_idx] = rec
+        else:
+            by_msg_idx[msg_idx] = _merge_message_records(by_msg_idx[msg_idx], rec)
+    return list(by_msg_idx.values())
+
+
+def _component_latest_ts(messages: list[dict]) -> float:
+    best = 0.0
+    for m in messages:
+        t = _parse_create_time_to_ts(m.get("create_time"))
+        if t is not None and t > best:
+            best = t
+    return best
 
 
 def _order_messages_by_parent_chain(messages: list[dict]) -> list[dict]:
     """Order messages using id/parentId/children as a dependency graph.
-    - 부모(id/parentId 혹은 children 관계)는 항상 자식보다 먼저 나온다.
-    - 같은 레벨에서는 create_time(숫자) -> id 순으로 정렬한다.
-    이렇게 하면 일반적인 “유저 질문 → AI 답변 → 후속 질문 …” 순서가 보장된다."""
-    by_id = {m["id"]: m for m in messages if m.get("id")}
+    - Parents (via parentId or children edges) always precede children.
+    - Within a level, sort by create_time (numeric) then id.
+    This preserves typical user → assistant → follow-up turn order."""
+    by_id: dict[str, dict] = {}
+    for m in messages:
+        gk = _graph_key(m)
+        if gk:
+            by_id[gk] = m
     if not by_id:
         return sorted(messages, key=lambda m: (_parse_create_time_to_ts(m.get("create_time")) or float("inf"), m.get("id") or ""))
 
-    children_map: dict[str, set[str]] = {mid: set() for mid in by_id}
-    indegree: dict[str, int] = {mid: 0 for mid in by_id}
+    children_map: dict[str, set[str]] = {gk: set() for gk in by_id}
+    indegree: dict[str, int] = {gk: 0 for gk in by_id}
     seen_edges: set[tuple[str, str]] = set()
 
     def _add_edge(parent_id: str, child_id: str) -> None:
@@ -1191,45 +1999,51 @@ def _order_messages_by_parent_chain(messages: list[dict]) -> list[dict]:
         indegree[child_id] += 1
 
     for m in messages:
-        mid = m.get("id")
+        gk = _graph_key(m)
+        if not gk:
+            continue
         pid = m.get("parentId")
-        if mid and pid:
-            _add_edge(pid, mid)
+        if pid:
+            pk = _graph_key_lookup(pid, by_id)
+            if pk:
+                _add_edge(pk, gk)
     for m in messages:
-        mid = m.get("id")
-        if not mid:
+        gk = _graph_key(m)
+        if not gk:
             continue
         for cid in (m.get("children") or []):
             if cid:
-                _add_edge(mid, cid)
+                ck = _graph_key_lookup(cid, by_id)
+                if ck:
+                    _add_edge(gk, ck)
 
-    def _key(mid: str) -> tuple[float, str]:
-        msg = by_id[mid]
+    def _key(gk: str) -> tuple[float, str]:
+        msg = by_id[gk]
         ts = _parse_create_time_to_ts(msg.get("create_time"))
-        return (ts if ts is not None else float("inf"), mid)
+        return (ts if ts is not None else float("inf"), gk)
 
     import heapq
     heap: list[tuple[float, str]] = []
-    for mid, deg in indegree.items():
+    for gk, deg in indegree.items():
         if deg == 0:
-            heapq.heappush(heap, _key(mid))
+            heapq.heappush(heap, _key(gk))
 
     ordered_ids: list[str] = []
     while heap:
-        _, mid = heapq.heappop(heap)
-        ordered_ids.append(mid)
-        for cid in children_map.get(mid, ()):
+        _, gk = heapq.heappop(heap)
+        ordered_ids.append(gk)
+        for cid in children_map.get(gk, ()):
             indegree[cid] -= 1
             if indegree[cid] == 0:
                 heapq.heappush(heap, _key(cid))
 
-    remaining = [mid for mid in by_id.keys() if mid not in ordered_ids]
+    remaining = [gk for gk in by_id.keys() if gk not in ordered_ids]
     remaining.sort(key=_key)
     ordered_ids.extend(remaining)
 
-    ordered = [by_id[mid] for mid in ordered_ids]
+    ordered = [by_id[gk] for gk in ordered_ids]
 
-    no_id = [m for m in messages if not m.get("id")]
+    no_id = [m for m in messages if not _graph_key(m)]
     if no_id:
         no_id.sort(key=lambda m: (_parse_create_time_to_ts(m.get("create_time")) or float("inf"), m.get("role") or "", m.get("content") or ""))
         ordered.extend(no_id)
@@ -1254,57 +2068,60 @@ def _conversation_css() -> str:
         ".msg .content { white-space: pre-wrap; font-family: 'Segoe UI', 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif; }\n"
         ".msg .content .entity-ref { border-bottom: none; cursor: default; }\n"
         ".msg .content .entity-desc { font-size: 0.9em; color: #666; }\n"
+        ".msg-code-reasoning { margin-bottom: 10px; padding: 10px 12px; background: #1a2332; border-radius: 8px; border-left: 3px solid #a371f7; }\n"
+        ".msg-code-reasoning-label { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: #c9d1d9; margin-bottom: 6px; }\n"
+        ".msg-code-reasoning-body { margin: 0; white-space: pre-wrap; font-size: 0.875rem; color: #e6edf3; font-family: ui-monospace, Consolas, monospace; }\n"
+        ".msg-extra-wrap { margin: 8px 0; font-size: 0.8125rem; }\n"
+        ".msg-extra { margin: 6px 0; }\n"
+        ".msg-extra summary { cursor: pointer; color: #58a6ff; }\n"
+        ".msg-extra-pre { margin: 6px 0 0 0; padding: 8px 10px; background: #161b22; border-radius: 6px; white-space: pre-wrap; word-break: break-word; color: #c9d1d9; font-size: 0.75rem; max-height: 320px; overflow: auto; }\n"
+        ".msg-extra-line { margin: 4px 0; color: #8b949e; }\n"
     )
 
 
 def generate_conversation_html(
     snapshot: dict, uuid_entries: list, edge_offsets: list[int] | None, out_path: str
 ) -> None:
-    """세션 = (weakmap, table, part_of_key_child) 단위. 세션별로 블록을 나누고, 같은 세션 내에서는 id/parentId 순서로 메시지 표시."""
-    key_to_entries: dict[tuple, list] = {}
-    for entry in uuid_entries:
-        if len(entry) < 5 or entry[4] is None:
-            continue
-        weakmap_node, table_node, part_of_key_child, uuid_tree, msg_parts_elements = entry[:5]
-        key = (weakmap_node["node_index"], table_node["node_index"], part_of_key_child["node_index"])
-        key_to_entries.setdefault(key, []).append(entry)
-    if not key_to_entries:
+    """Write conversation_threads.html from globally collected messages (stem threads or graph components; not time-sliced)."""
+    all_messages = collect_unique_message_records_from_entries(snapshot, uuid_entries, edge_offsets)
+    if not all_messages:
         with open(out_path, "w", encoding="utf-8") as f:
             f.write("<!DOCTYPE html><html><body><p>No conversation data (message path not found).</p></body></html>")
         return
+    components = cluster_messages_into_threads(all_messages)
+    components.sort(key=_component_latest_ts, reverse=True)
     thread_blocks: list[tuple[float, str]] = []
-    for _key, entries in key_to_entries.items():
-        messages = []
-        seen_ids = set()
-        for ent in entries:
-            _, _, part_of_key_child, _, msg_parts_elements = ent[:5]
-            if msg_parts_elements is None:
-                continue
-            path_chain, elements_tree = msg_parts_elements
-            msg_idx = path_chain[0][0]["node_index"]
-            obj_idx = part_of_key_child.get("node_index") if part_of_key_child else None
-            rec = _build_message_record(snapshot, msg_idx, elements_tree, edge_offsets, object_node_index=obj_idx)
-            if rec.get("id") and rec["id"] not in seen_ids:
-                seen_ids.add(rec["id"])
-                messages.append(rec)
-        ordered = _order_messages_by_parent_chain(messages)
+    for comp in components:
+        ordered = _order_messages_by_parent_chain(comp)
         if not ordered:
-            ordered = messages
+            ordered = comp
         bubbles = []
         for m in ordered:
             content_raw = (m.get("content") or "").strip()
-            if content_raw is None or content_raw == "":
+            extra = m.get("conversation_extra") if isinstance(m.get("conversation_extra"), dict) else {}
+            code_r = (m.get("assistant_code_reasoning") or "").strip()
+            substantive_extra = _conversation_extra_has_substantive_fields(extra)
+            include_model_line = bool(content_raw) or bool(code_r) or substantive_extra
+            extra_html = _html_conversation_extra(extra, include_model_slug_line=include_model_line)
+            if not content_raw and not extra_html and not code_r:
                 continue
-            content = sanitize_message_content(content_raw)
-            if (m.get("channel") or "").strip().lower() == "commentary":
-                content += " [System/storage]"
+            body_parts: list[str] = []
+            if code_r:
+                body_parts.append(_html_assistant_code_reasoning(code_r))
+            if extra_html:
+                body_parts.append(extra_html)
+            if content_raw:
+                content = sanitize_message_content(content_raw)
+                if (m.get("channel") or "").strip().lower() == "commentary":
+                    content += " [System/storage]"
+                body_parts.append(f'<div class="content">{content}</div>')
             role_label = "User" if m.get("role") == "user" else ("Tool (" + m.get("tool_label_suffix", "tool") + ")" if m.get("role") == "tool" else "Assistant (ChatGPT)")
             time_display = _format_display_time(m.get("create_time"))
             bubbles.append(
                 f'<div class="msg {m.get("role", "unknown")}">'
                 f'<div class="role">{role_label}</div>'
-                f'<div class="content">{content}</div>'
-                f'<div class="time">Time: {escape_html(time_display)}</div></div>'
+                + "".join(body_parts)
+                + f'<div class="time">Time: {escape_html(time_display)}</div></div>'
             )
         if not bubbles:
             continue
@@ -1321,7 +2138,7 @@ def generate_conversation_html(
                 latest_ts = t
         block = (
             '<div class="thread">'
-            f'<div class="thread-title">Session{escape_html(time_range) if time_range else ""}</div>'
+            f'<div class="thread-title">Thread{escape_html(time_range) if time_range else ""}</div>'
             f'<div class="chat">{"".join(bubbles)}</div></div>'
         )
         thread_blocks.append((latest_ts, block))
@@ -1341,36 +2158,19 @@ def generate_conversation_html(
 def generate_conversation_json(
     snapshot: dict, uuid_entries: list, edge_offsets: list[int] | None, out_path: str
 ) -> None:
-    """세션 = (weakmap, table, part_of_key_child) 단위. HTML과 동일한 세션 구분으로 JSON 출력."""
-    key_to_entries: dict[tuple, list] = {}
-    for entry in uuid_entries:
-        if len(entry) < 5 or entry[4] is None:
-            continue
-        weakmap_node, table_node, part_of_key_child, uuid_tree, msg_parts_elements = entry[:5]
-        key = (weakmap_node["node_index"], table_node["node_index"], part_of_key_child["node_index"])
-        key_to_entries.setdefault(key, []).append(entry)
-    if not key_to_entries:
+    """Same grouping as HTML: one threads[] element per stem- or graph-based thread."""
+    all_messages = collect_unique_message_records_from_entries(snapshot, uuid_entries, edge_offsets)
+    if not all_messages:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump({"threads": [], "message": "No conversation data (message path not found)."}, f, ensure_ascii=False, indent=2)
         return
+    components = cluster_messages_into_threads(all_messages)
+    components.sort(key=_component_latest_ts, reverse=True)
     thread_list: list[tuple[float, dict]] = []
-    for _key, entries in key_to_entries.items():
-        messages = []
-        seen_ids = set()
-        for ent in entries:
-            _, _, part_of_key_child, _, msg_parts_elements = ent[:5]
-            if msg_parts_elements is None:
-                continue
-            path_chain, elements_tree = msg_parts_elements
-            msg_idx = path_chain[0][0]["node_index"]
-            obj_idx = part_of_key_child.get("node_index") if part_of_key_child else None
-            rec = _build_message_record(snapshot, msg_idx, elements_tree, edge_offsets, object_node_index=obj_idx)
-            if rec.get("id") and rec["id"] not in seen_ids:
-                seen_ids.add(rec["id"])
-                messages.append(rec)
-        ordered = _order_messages_by_parent_chain(messages)
+    for comp in components:
+        ordered = _order_messages_by_parent_chain(comp)
         if not ordered:
-            ordered = messages
+            ordered = comp
         session_start = None
         session_end = None
         out_messages = []
@@ -1380,9 +2180,11 @@ def generate_conversation_json(
             if t is not None and t > latest_ts:
                 latest_ts = t
             content_raw = (m.get("content") or "").strip()
-            if not content_raw:
+            extra = m.get("conversation_extra") or {}
+            code_r = (m.get("assistant_code_reasoning") or "").strip()
+            if not content_raw and not code_r and not extra:
                 continue
-            content_plain, entities = _content_plain_and_entities(content_raw)
+            content_plain, entities = _content_plain_and_entities(content_raw) if content_raw else ("", [])
             if (m.get("channel") or "").strip().lower() == "commentary":
                 content_plain += " [System/storage]"
             role = m.get("role", "unknown")
@@ -1398,6 +2200,13 @@ def generate_conversation_json(
                 msg_obj["related_info"] = entities
             if m.get("tool_metadata"):
                 msg_obj["tool_metadata"] = m["tool_metadata"]
+            if code_r:
+                msg_obj["assistant_code_reasoning"] = code_r
+                msg_obj["assistant_code_reasoning_label"] = "Assistant internal reasoning (code)"
+            if extra:
+                msg_obj["conversation_extra"] = extra
+            if m.get("message_node_index") is not None:
+                msg_obj["message_node_index"] = m["message_node_index"]
             out_messages.append(msg_obj)
             if time_display != "No time":
                 if session_start is None:
@@ -1435,7 +2244,40 @@ def _common_css() -> str:
         "details > summary::before { content: '▶ '; font-size: 10px; }\n"
         "details[open] > summary::before { content: '▼ '; }\n"
         "ul.tree { list-style: none; padding-left: 1.25rem; margin: 6px 0; }\n"
+        ".thread-section { margin: 2rem 0; padding: 1rem 1rem 1.25rem 1.25rem; background: #0d1117; border-radius: 8px; border: 1px solid #30363d; }\n"
+        ".thread-heading { font-size: 1rem; font-weight: 600; color: #58a6ff; margin: 0 0 1rem 0; }\n"
     )
+
+
+def _collect_adaptive_candidate_entries(
+    snapshot: dict, edge_offsets: list[int] | None
+) -> list[tuple]:
+    """Find conversation-like objects globally by property signature.
+
+    Candidate signature: object node with id/parentId/children/message.
+    This intentionally avoids any fixed path assumptions (e.g. WeakMap/table).
+    """
+    node_count = snapshot["snapshot"]["node_count"]
+    entries: list[tuple] = []
+    for node_index in range(node_count):
+        node = get_node(snapshot, node_index)
+        if node.get("type") != "object":
+            continue
+        if not _node_has_required_props(snapshot, node_index, edge_offsets):
+            continue
+
+        msg_parts_elements = get_message_content_parts_elements_tree(snapshot, node_index, edge_offsets)
+        if msg_parts_elements is None:
+            msg_idx = get_property_node(snapshot, node_index, "message", edge_offsets)
+            if msg_idx is not None:
+                msg_node = get_node(snapshot, msg_idx)
+                msg_node["edge_from_parent"] = {"type": "property", "label": "message"}
+                msg_parts_elements = ([(msg_node, msg_node["edge_from_parent"])], {})
+
+        id_str = get_property_string(snapshot, node_index, "id", edge_offsets)
+        # Keep legacy entry shape so downstream conversation HTML/JSON can reuse current logic.
+        entries.append((node, node, node, None, msg_parts_elements, id_str))
+    return entries
 
 
 def generate_html_weakmaps(
@@ -1444,112 +2286,205 @@ def generate_html_weakmaps(
     write_structure_report: bool = True,
     write_conversation: bool = True,
 ) -> tuple[int, int]:
-    """Generate UUID-only and/or conversation HTML. Returns (uuid_entries_count, message_path_count)."""
-    weakmap_indices = find_all_nodes_by_exact_name(snapshot, "WeakMap")
-    if not weakmap_indices:
-        if write_structure_report:
-            with open(uuid_only_path, "w", encoding="utf-8") as f:
-                f.write("<!DOCTYPE html><html><body><p>WeakMap (exact) not found.</p></body></html>")
-        return 0, 0
+    """Generate reports using adaptive global signature scan (no fixed container path dependency).
+
+    Returns (uuid_entries_count, message_path_count).
+    """
     edge_offsets = get_edge_offsets(snapshot)
-    entries = []
-    uuid_entries = []
-    for idx in weakmap_indices:
-        node = get_node(snapshot, idx)
-        table_index, table_edge = find_child_by_exact_name_and_edge(snapshot, idx, "table", edge_offsets)
-        if table_index is None:
-            continue
-        table_node = get_node(snapshot, table_index)
-        table_tree = build_depth1_tree(snapshot, table_index, edge_offsets)
-        entries.append((node, table_node, table_edge, table_tree))
-    if not entries:
-        if write_structure_report:
-            with open(uuid_only_path, "w", encoding="utf-8") as f:
-                f.write("<!DOCTYPE html><html><body><p>WeakMap with child 'table' not found.</p></body></html>")
-        return 0, 0
-    seen_uuid_node_index = set()
-    for weakmap_node, table_node, table_edge, table_tree in entries:
-        for child in table_tree["children"]:
-            edge = child.get("edge_from_parent", {})
-            edge_label = str(edge.get("label", ""))
-            is_part_of_key_object = child.get("type") == "object" and "part of key" in edge_label
-            has_structure = is_part_of_key_object and object_has_id_parentid_children_message_structure(
-                snapshot, child["node_index"], edge_offsets
-            )
-            if not has_structure:
-                continue
-            obj_tree = build_depth1_tree(snapshot, child["node_index"], edge_offsets)
-            for grandchild in obj_tree["children"]:
-                gedge = grandchild.get("edge_from_parent", {})
-                g_label = str(gedge.get("label", ""))
-                g_name = grandchild.get("name", "")
-                if not (contains_uuid(g_label) or contains_uuid(g_name)):
-                    continue
-                uid = grandchild["node_index"]
-                if uid in seen_uuid_node_index:
-                    continue
-                seen_uuid_node_index.add(uid)
-                m = UUID_PATTERN.search(g_label or "")
-                uuid_str = m.group(0) if m else (UUID_PATTERN.search(g_name or "").group(0) if UUID_PATTERN.search(g_name or "") else None)
-                uuid_tree = build_depth_n_tree(snapshot, uid, 4, edge_offsets)
-                obj_with_props = get_object_with_required_props(snapshot, child["node_index"], edge_offsets)
-                msg_from_obj = get_message_content_parts_elements_tree(snapshot, obj_with_props, edge_offsets) if obj_with_props >= 0 else None
-                msg_from_uuid = get_message_content_parts_elements_tree(snapshot, uid, edge_offsets)
-                # 각 UUID별로 해당 노드의 메시지를 쓰기 위해 UUID 노드 메시지를 우선 사용 (다른 ID인데 같은 메시지가 나오는 것 방지)
-                msg_parts_elements = msg_from_uuid if msg_from_uuid is not None else msg_from_obj
-                uuid_entries.append((weakmap_node, table_node, child, uuid_tree, msg_parts_elements, uuid_str))
+    uuid_entries = _collect_adaptive_candidate_entries(snapshot, edge_offsets)
     found_message_path = sum(1 for e in uuid_entries if len(e) > 4 and e[4] is not None)
+
     out_dir = os.path.dirname(uuid_only_path)
     if write_conversation:
         conversation_path = os.path.join(out_dir, "conversation_threads.html")
         conversation_json_path = os.path.join(out_dir, "conversation_threads.json")
         generate_conversation_html(snapshot, uuid_entries, edge_offsets, conversation_path)
         generate_conversation_json(snapshot, uuid_entries, edge_offsets, conversation_json_path)
+
     if not write_structure_report:
         return len(uuid_entries), found_message_path
+
+    partition: tuple[list[int], list[list], list, list[list[dict]]] | None = None
+    if uuid_entries:
+        partition = _partition_structure_report_entries(snapshot, uuid_entries, edge_offsets)
+
     header_uuid = (
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
-        "<title>Structure Report — Heap Snapshot Forensics</title>\n<style>\n" + _common_css() + "</style>\n</head>\n<body>\n"
+        "<title>Structure Report — Heap Snapshot Forensics</title>\n<style>\n"
+        + _common_css()
+        + "</style>\n</head>\n<body>\n"
         "<header class=\"report-header\"><h1>Structure Report</h1>\n"
-        f"<p class=\"report-meta\">{len(uuid_entries)} objects · {found_message_path} with message content</p></header>\n"
+        f"<p class=\"report-meta\">{len(uuid_entries)} candidate objects · {found_message_path} with message path</p></header>\n"
     )
     with open(uuid_only_path, "w", encoding="utf-8") as f:
         f.write(header_uuid)
-        for entry in uuid_entries:
-            weakmap_node, table_node, part_of_key_child, uuid_tree = entry[:4]
+        if not uuid_entries:
+            f.write("<p>No conversation-like object found by adaptive signature scan.</p>")
+            f.write("</body></html>")
+            return 0, 0
+
+        thread_order, thread_entries, orphan_entries, components = partition
+
+        def write_one_structure_entry(entry: tuple) -> None:
+            obj_node = entry[2]
             msg_parts_elements = entry[4] if len(entry) > 4 else None
-            uuid_str = entry[5] if len(entry) > 5 else None
-            # Root = part of key object (table → "part of key" → full subtree from here)
-            root_idx = part_of_key_child["node_index"]
-            root_node = get_node(snapshot, root_idx)
-            fallback_uuid = uuid_str or (str(uuid_tree.get("name") or "") if uuid_tree else None)
-            # 1) Root: part of key — title = UUID for identification
+            id_str = entry[5] if len(entry) > 5 else None
+            obj_idx = obj_node["node_index"]
             f.write("<details>\n<summary class=\"node\">")
-            f.write(object_summary_html(snapshot, root_node, None, edge_offsets, fallback_uuid=fallback_uuid))
-            f.write("</summary>\n<ul class=\"tree\">")
-            # 2) Only the branch for this entry: part of key → [key=UUID] → conversation object subtree
-            uid = uuid_tree["node_index"] if uuid_tree else -1
-            part_of_key_tree = build_depth_n_tree(snapshot, root_idx, 4, edge_offsets)
-            for ch in part_of_key_tree.get("children", []):
-                if ch.get("node_index") == uid:
-                    write_tree_depth_n(f, ch)
-                    break
-            # 3) Message text summary line for quick read
+            f.write(object_summary_html(snapshot, obj_node, None, edge_offsets, fallback_uuid=id_str))
+            f.write("</summary>\n")
+            write_structure_report_wrapper_subtree(f, snapshot, obj_idx, edge_offsets)
+            ext = _structure_entry_extracted_text(snapshot, entry, edge_offsets)
             if msg_parts_elements is not None:
-                path_chain, elements_tree = msg_parts_elements
-                strings = collect_strings_from_elements_tree(elements_tree)
-                text = " ".join(s for s in strings if s and s.strip()).strip()
-                if not text:
-                    text = "(no text)"
-                f.write("<li class=\"node node-message-text\"><span class=\"meta\">Message: </span>")
-                f.write(escape_html(text))
-                f.write("</li>")
+                f.write('<ul class="tree"><li class="node node-message-text"><span class="meta\">Extracted text: </span>')
+                f.write(escape_html(ext or "(no text)"))
+                f.write("</li></ul>")
             else:
-                f.write("<li class=\"node node-missing\">Message path not found for this object.</li>")
-            f.write("</ul>\n</details>\n")
+                f.write('<ul class="tree"><li class="node node-missing">Message path not found for this object.</li></ul>')
+            f.write("</details>\n")
+
+        for ti in thread_order:
+            ents = thread_entries[ti]
+            if not ents:
+                continue
+            title = escape_html(_structure_thread_section_title(components[ti]))
+            f.write('<section class="thread-section">')
+            f.write(f'<h2 class="thread-heading">Thread — {title}</h2>\n')
+            for ent in ents:
+                write_one_structure_entry(ent)
+            f.write("</section>\n")
+
+        if orphan_entries:
+            f.write('<section class="thread-section">')
+            f.write('<h2 class="thread-heading">Other (unassigned to thread)</h2>\n')
+            for ent in orphan_entries:
+                write_one_structure_entry(ent)
+            f.write("</section>\n")
         f.write("</body></html>")
     return len(uuid_entries), found_message_path
+
+
+def _format_byte_size(n: int) -> str:
+    """Return a human-readable byte size (binary units)."""
+    if n < 1024:
+        return f"{n} B"
+    v = float(n)
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        v /= 1024.0
+        if v < 1024:
+            return f"{v:.2f} {unit}"
+    return f"{v:.2f} PiB"
+
+
+def _hash_file_md5_sha256(path: str, chunk_size: int = 1024 * 1024) -> tuple[str, str]:
+    """Compute MD5 and SHA-256 in one pass (for chain-of-custody style records)."""
+    md5 = hashlib.md5()
+    sha256 = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            md5.update(chunk)
+            sha256.update(chunk)
+    return md5.hexdigest(), sha256.hexdigest()
+
+
+def _snapshot_model_stat_lines(snapshot: dict | None) -> list[str]:
+    if not snapshot:
+        return ["(Snapshot not loaded; node/edge counts unavailable.)"]
+    sn = snapshot.get("snapshot") or {}
+    lines: list[str] = []
+    nc = sn.get("node_count")
+    if nc is not None:
+        lines.append(f"snapshot.node_count: {nc}")
+    edges = sn.get("edges")
+    if isinstance(edges, list):
+        lines.append(f"snapshot.edges (array length): {len(edges)}")
+    else:
+        ec = sn.get("edge_count")
+        if ec is not None:
+            lines.append(f"snapshot.edge_count: {ec}")
+    return lines or ["(No node_count or edges metadata in snapshot payload.)"]
+
+
+def write_forensic_run_summary(
+    path: str,
+    *,
+    tool_version: str,
+    snapshot_path: str,
+    output_dir: str,
+    analysis_start_utc_iso: str,
+    elapsed_sec: float,
+    result: dict,
+    snapshot: dict | None,
+    generate_structure_report: bool,
+) -> None:
+    """Write a plain-text forensic-style run record next to HTML/JSON outputs."""
+    lines: list[str] = []
+    ap = os.path.abspath(snapshot_path)
+    od = os.path.abspath(output_dir)
+
+    lines.append("=" * 78)
+    lines.append("V8 HEAP SNAPSHOT FORENSICS — RUN RECORD")
+    lines.append("=" * 78)
+    lines.append("")
+    lines.append(f"Tool version: {tool_version}")
+    lines.append(f"Python: {sys.version.split()[0]} ({sys.executable})")
+    lines.append(f"Platform: {platform.platform()}")
+    lines.append(f"Processor: {platform.processor() or 'n/a'}")
+    lines.append(f"Hostname: {platform.node()}")
+    lines.append("")
+    lines.append("--- Timing ---")
+    lines.append(f"Analysis start (UTC): {analysis_start_utc_iso}")
+    lines.append(f"Elapsed wall clock: {elapsed_sec:.6f} s")
+    lines.append("")
+    lines.append("--- Source file (evidence) ---")
+    lines.append(f"Path (absolute): {ap}")
+    try:
+        st = os.stat(snapshot_path)
+        lines.append(f"Size (bytes): {st.st_size}")
+        lines.append(f"Size (human): {_format_byte_size(st.st_size)}")
+        lines.append(f"Mtime (UTC): {datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()}")
+        md5_hex, sha256_hex = _hash_file_md5_sha256(snapshot_path)
+        lines.append(f"MD5:    {md5_hex}")
+        lines.append(f"SHA-256: {sha256_hex}")
+    except OSError as exc:
+        lines.append(f"(Could not stat or hash file: {exc})")
+    lines.append("")
+    lines.append("--- Snapshot parse model ---")
+    lines.extend(_snapshot_model_stat_lines(snapshot))
+    lines.append("")
+    lines.append("--- Extraction summary ---")
+    err = result.get("error")
+    lines.append(f"Status: {'FAILED' if err else 'SUCCESS'}")
+    if err:
+        lines.append(f"Error: {err}")
+    lines.append(f"Adaptive candidate objects: {result.get('uuid_entries_count', 0)}")
+    lines.append(f"Objects with message content path: {result.get('message_path_count', 0)}")
+    lines.append("")
+    lines.append("--- Output directory ---")
+    lines.append(od)
+    lines.append("")
+    lines.append("--- Output artifacts (this run) ---")
+    if generate_structure_report:
+        lines.append(f"- structure_report.html: {result.get('uuid_only_path')}")
+    else:
+        lines.append("- structure_report.html: (not generated; on-demand in GUI)")
+    lines.append(f"- conversation_threads.html: {result.get('conversation_path')}")
+    lines.append(f"- conversation_threads.json: {result.get('conversation_json_path')}")
+    lines.append(f"- {FORENSIC_RUN_SUMMARY_FILENAME}: {os.path.abspath(path)}")
+    lines.append("")
+    lines.append("=" * 78)
+    lines.append("END OF RECORD")
+    lines.append("=" * 78)
+
+    out_dir = os.path.dirname(os.path.abspath(path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def run_analysis(
@@ -1560,24 +2495,31 @@ def run_analysis(
     """
     Load a heap snapshot, run WeakMap/UUID and conversation extraction, write HTML reports.
     When generate_structure_report is False, only conversation_threads are written (structure_report on demand).
-    Returns dict with keys: uuid_only_path, conversation_path, snapshot_path, error (if any).
+    If output_dir is omitted, writes next to heap_forensics.py (the tool directory).
+    Returns dict with keys: uuid_only_path, conversation_path, conversation_json_path,
+    forensic_summary_path, snapshot_path, error (if any).
     """
     if output_dir is None:
-        output_dir = os.path.dirname(os.path.abspath(snapshot_path))
+        output_dir = os.path.dirname(os.path.abspath(__file__))
     os.makedirs(output_dir, exist_ok=True)
     uuid_only_path = os.path.join(output_dir, "structure_report.html")
     conversation_path = os.path.join(output_dir, "conversation_threads.html")
     conversation_json_path = os.path.join(output_dir, "conversation_threads.json")
+    forensic_summary_path = os.path.join(output_dir, FORENSIC_RUN_SUMMARY_FILENAME)
     result = {
         "snapshot_path": snapshot_path,
         "uuid_only_path": uuid_only_path,
         "conversation_path": conversation_path,
         "conversation_json_path": conversation_json_path,
+        "forensic_summary_path": forensic_summary_path,
         "error": None,
         "weakmap_count": 0,
         "uuid_entries_count": 0,
         "message_path_count": 0,
     }
+    t0 = time.perf_counter()
+    analysis_start = datetime.now(timezone.utc).isoformat()
+    snapshot: dict | None = None
     try:
         snapshot = load_snapshot(snapshot_path)
         num_entries, num_messages = generate_html_weakmaps(
@@ -1588,9 +2530,26 @@ def run_analysis(
         )
         result["uuid_entries_count"] = num_entries
         result["message_path_count"] = num_messages
-        result["weakmap_count"] = len(find_all_nodes_by_exact_name(snapshot, "WeakMap"))
+        # Backward-compatible field name. Now means "adaptive candidate count".
+        result["weakmap_count"] = num_entries
     except Exception as e:
         result["error"] = str(e)
+    finally:
+        elapsed = time.perf_counter() - t0
+        try:
+            write_forensic_run_summary(
+                forensic_summary_path,
+                tool_version=TOOL_VERSION,
+                snapshot_path=snapshot_path,
+                output_dir=output_dir,
+                analysis_start_utc_iso=analysis_start,
+                elapsed_sec=elapsed,
+                result=result,
+                snapshot=snapshot,
+                generate_structure_report=generate_structure_report,
+            )
+        except Exception:
+            pass
     return result
 
 
@@ -1631,6 +2590,7 @@ def main():
     print("Done:", result["uuid_only_path"])
     print("Conversation HTML:", result["conversation_path"])
     print("Conversation JSON:", result["conversation_json_path"])
+    print("Forensic summary:", result.get("forensic_summary_path", ""))
     print("(See HTML header for message->content->parts->elements count; 0 = path not in heap or different names)")
 
 
