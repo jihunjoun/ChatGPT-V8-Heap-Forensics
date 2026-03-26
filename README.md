@@ -44,6 +44,7 @@ The benchmark dataset (heap snapshot files and ground-truth logs) is available f
 | `800msg_active.heapsnapshot` | 800 pairs | 800 | 0 | Full dataset, pre-deletion snapshot |
 | `800msg_400active_400deleted.heapsnapshot` | 800 pairs | 400 | 400 | Post-deletion snapshot (8 conversations deleted via UI) |
 | `800msg_400active_400deleted_latest.heapsnapshot` | 800 pairs | 400 | 400 | Post-deletion snapshot collected from the latest ChatGPT client |
+| `metadata_scenarios.heapsnapshot` | — | — | — | Supplementary snapshot containing image generation, file upload, and web search conversations for metadata artifact validation |
 
 ### Ground-Truth Files
 
@@ -51,6 +52,17 @@ The benchmark dataset (heap snapshot files and ground-truth logs) is available f
 | --- | --- | --- |
 | `ground_truth_800msg.txt` | `800msg_400active_400deleted.heapsnapshot` | Independent log of all user prompts and AI responses recorded at generation time |
 | `ground_truth_800msg_latest.txt` | `800msg_400active_400deleted_latest.heapsnapshot` | Ground-truth log for the latest ChatGPT client dataset |
+| `ground_truth_metadata_scenarios.txt` | `metadata_scenarios.heapsnapshot` | Ground-truth log for metadata artifact scenarios including image generation parameters, uploaded file details, and web search results |
+
+### Dataset Description
+
+The primary dataset (text-based conversations) validates extraction accuracy for message content, author roles, timestamps, and thread reconstruction. The supplementary metadata scenarios dataset validates the extraction of additional artifact types:
+
+| Scenario | Example Prompt | Target Artifacts |
+| --- | --- | --- |
+| Image Generation | "Could you draw a dog?" | Image dimensions, DALL-E generation ID, image title, content moderation status |
+| File/Image Upload | "What kind of fruit is this?" (with photo) | Attachment metadata (filename, size, dimensions, source), asset pointers |
+| Web Search | "Who is Jihun Joun?" | Search result groups (domain, title, URL, snippet), content references, safe URLs |
 
 All snapshots were collected in a controlled virtual machine environment via the Chrome DevTools Protocol (`HeapProfiler` domain). Each snapshot was captured from a clean VM state to prevent cross-contamination between sessions. The ground-truth files contain independently logged records of all user inputs and AI responses at the time of generation, serving as the reference baseline for verifying extraction accuracy.
 
@@ -94,10 +106,22 @@ The tool produces four output files:
 
 ## How It Works
 
-1. **Graph Reconstruction** — Parses the `.heapsnapshot` file and reconstructs the directed object graph by interpreting the metadata schema and decoding node/edge arrays
-2. **Adaptive Signature Scan** — Scans all object nodes in the heap for the structural signature of conversation data, specifically objects possessing the four required properties: `id`, `parentId`, `children`, and `message`. This approach does not rely on any fixed container path (e.g., WeakMap), making it resilient to application refactors
-3. **Data Extraction** — For each matched object, extracts message content (via `message → content → parts`), author role, creation timestamp, and metadata including search queries, content references, and image generation parameters
-4. **Thread Reconstruction** — Traces `parentId` and `children` fields to reconstruct the original conversation flow and branching structure, including regenerated responses
+1. **Graph Reconstruction** — The `.heapsnapshot` file is parsed by dynamically interpreting the metadata schema (`snapshot.meta.node_fields`, `snapshot.meta.edge_fields`). The flattened node and edge arrays are decoded into an indexed object graph with precomputed edge offsets for efficient traversal.
+
+2. **Adaptive Signature Scan** — All nodes in the graph are scanned to identify conversation data candidates. For each node of type `object`, the tool checks whether it possesses the four required properties (`id`, `parentId`, `children`, `message`) by inspecting its outgoing edges. It then verifies the `message → content → parts → elements` path exists to confirm the object contains extractable conversation data. This approach does not depend on any fixed container path (e.g., WeakMap → table), making it resilient to application refactors.
+
+3. **Data Extraction** — For each matched candidate object, the tool traverses multiple paths to extract conversation artifacts:
+   - **Text content**: `message → content → parts → (n) → text → (n)` with fallback to `parts → (n) → elements` and direct string values
+   - **AI reasoning**: When `message → content → content_type` is `code`, extracts `message → content → text` as AI internal reasoning output
+   - **Author info**: `message → author → role`, `name`, and `author → metadata → real_author`, `source`
+   - **Timestamp**: `message → create_time → value`
+   - **File uploads**: `message → metadata → attachments → (n) → {id, name, height, width, size, source}`
+   - **Image generation**: `message → content → parts → (n) → {height, width, size_bytes}` and `parts → (n) → metadata → dalle → gen_id`, `generation → gen_id`, `sanitized`; plus `message → metadata → image_gen_title`
+   - **Web search results**: `message → metadata → search_result_groups → (n) → {domain, entries → (n) → {title, url, snippet, attribution}}`
+   - **Content references**: `message → metadata → content_references → (n) → {title, url, snippet, attribution}` and `content_references → (n) → items → (n) → {title, url, snippet, attribution}`
+   - **Other metadata**: `message → metadata → model_slug`, `safe_urls`
+
+4. **Thread Reconstruction** — Extracted messages are grouped into conversation threads by tracing `parentId` and `children` fields. Messages sharing a common root (`client-created-root`) are clustered into the same thread. Within each thread, messages are ordered chronologically by `create_time`, and branching from regenerated responses is preserved.
 
 ## Extracted Artifacts
 
@@ -105,12 +129,14 @@ The tool produces four output files:
 | --- | --- |
 | Message Content | User prompts and AI responses (up to ~1,024 characters per message) |
 | Message Metadata | Author role, creation timestamp, message ID, model name |
+| AI Reasoning | Internal reasoning text when content_type is `code` |
 | Content References | External source URLs, attributions, thumbnails |
-| File Upload Metadata | Filename, MIME type, file size, token count |
-| Image Generation Metadata | Generation prompt, image dimensions, DALL-E generation ID |
+| File Upload Metadata | Filename, MIME type, file size, dimensions, upload source |
+| Image Generation Metadata | Image dimensions, DALL-E generation ID, generation request ID, content moderation status, image title |
 | Search Queries | Web search queries issued by the AI model |
-| Search Result Groups | Grouped search results with domain, title, URL, and snippet |
-| Tool Invocations | Tool message details including author source and real_author metadata |
+| Search Result Groups | Grouped search results with domain, title, URL, snippet, and attribution |
+| Safe URLs | External URLs verified as safe by the AI model |
+| Tool Invocations | Tool message details including author name, source, and real_author metadata |
 
 ## Citation
 
