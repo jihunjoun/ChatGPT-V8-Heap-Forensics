@@ -17,7 +17,7 @@ This project proposes a methodology for systematically extracting conversation d
 - Conversation artifacts, even after being deleted through the UI, remain referenced and recoverable from browser memory
 - The tool achieves a **100% message identification rate** across all tested scenarios
 - Data persists as long as the browser tab remains active, regardless of elapsed time, memory pressure, or incognito mode
-- The adaptive extraction approach is resilient to application updates (e.g., ChatGPT's transition to private class fields in v5.x)
+- The adaptive extraction approach has been validated across ChatGPT client updates including the transition to private class fields (v5.2–v5.3)
 
 ## Repository Structure
 
@@ -44,7 +44,7 @@ The benchmark dataset (heap snapshot files and ground-truth logs) is available f
 | `800msg_active.heapsnapshot` | 800 pairs | 800 | 0 | Full dataset, pre-deletion snapshot |
 | `800msg_400active_400deleted.heapsnapshot` | 800 pairs | 400 | 400 | Post-deletion snapshot (8 conversations deleted via UI) |
 | `800msg_400active_400deleted_latest.heapsnapshot` | 800 pairs | 400 | 400 | Post-deletion snapshot collected from the latest ChatGPT client |
-| `metadata_scenarios.heapsnapshot` | — | — | — | Supplementary snapshot containing image generation, file upload, and web search conversations for metadata artifact validation |
+| `multimodal_scenarios.heapsnapshot` | — | — | — | Supplementary snapshot containing image generation, file upload, and web search conversations for metadata artifact validation |
 
 ### Ground-Truth Files
 
@@ -52,17 +52,11 @@ The benchmark dataset (heap snapshot files and ground-truth logs) is available f
 | --- | --- | --- |
 | `ground_truth_800msg.txt` | `800msg_400active_400deleted.heapsnapshot` | Independent log of all user prompts and AI responses recorded at generation time |
 | `ground_truth_800msg_latest.txt` | `800msg_400active_400deleted_latest.heapsnapshot` | Ground-truth log for the latest ChatGPT client dataset |
-| `ground_truth_metadata_scenarios.txt` | `metadata_scenarios.heapsnapshot` | Ground-truth log for metadata artifact scenarios including image generation parameters, uploaded file details, and web search results |
+| `ground_truth_multimodal_scenarios.heapsnapshot.txt` | `multimodal_scenarios.heapsnapshot` | Ground-truth log for metadata artifact scenarios including image generation parameters, uploaded file details, and web search results |
 
 ### Dataset Description
 
-The primary dataset (text-based conversations) validates extraction accuracy for message content, author roles, timestamps, and thread reconstruction. The supplementary metadata scenarios dataset validates the extraction of additional artifact types:
-
-| Scenario | Example Prompt | Target Artifacts |
-| --- | --- | --- |
-| Image Generation | "Could you draw a dog?" | Image dimensions, DALL-E generation ID, image title, content moderation status |
-| File/Image Upload | "What kind of fruit is this?" (with photo) | Attachment metadata (filename, size, dimensions, source), asset pointers |
-| Web Search | "Who is Jihun Joun?" | Search result groups (domain, title, URL, snippet), content references, safe URLs |
+The primary dataset (text-based conversations) validates extraction accuracy for message content, author roles, timestamps, and thread reconstruction.
 
 All snapshots were collected in a controlled virtual machine environment via the Chrome DevTools Protocol (`HeapProfiler` domain). Each snapshot was captured from a clean VM state to prevent cross-contamination between sessions. The ground-truth files contain independently logged records of all user inputs and AI responses at the time of generation, serving as the reference baseline for verifying extraction accuracy.
 
@@ -112,7 +106,7 @@ The tool produces four output files:
 
 3. **Data Extraction** — For each matched candidate object, the tool traverses multiple paths to extract conversation artifacts:
    - **Text content**: `message → content → parts → (n) → text → (n)` with fallback to `parts → (n) → elements` and direct string values
-   - **AI reasoning**: When `message → content → content_type` is `code`, extracts `message → content → text` as AI internal reasoning output
+   - **AI reasoning**: `message → content → text` as AI internal reasoning output
    - **Author info**: `message → author → role`, `name`, and `author → metadata → real_author`, `source`
    - **Timestamp**: `message → create_time → value`
    - **File uploads**: `message → metadata → attachments → (n) → {id, name, height, width, size, source}`
@@ -122,21 +116,6 @@ The tool produces four output files:
    - **Other metadata**: `message → metadata → model_slug`, `safe_urls`
 
 4. **Thread Reconstruction** — Extracted messages are grouped into conversation threads by tracing `parentId` and `children` fields. Messages sharing a common root (`client-created-root`) are clustered into the same thread. Within each thread, messages are ordered chronologically by `create_time`, and branching from regenerated responses is preserved.
-
-## Extracted Artifacts
-
-| Artifact | Description |
-| --- | --- |
-| Message Content | User prompts and AI responses (up to ~1,024 characters per message) |
-| Message Metadata | Author role, creation timestamp, message ID, model name |
-| AI Reasoning | Internal reasoning text when content_type is `code` |
-| Content References | External source URLs, attributions, thumbnails |
-| File Upload Metadata | Filename, MIME type, file size, dimensions, upload source |
-| Image Generation Metadata | Image dimensions, DALL-E generation ID, generation request ID, content moderation status, image title |
-| Search Queries | Web search queries issued by the AI model |
-| Search Result Groups | Grouped search results with domain, title, URL, snippet, and attribution |
-| Safe URLs | External URLs verified as safe by the AI model |
-| Tool Invocations | Tool message details including author name, source, and real_author metadata |
 
 ## Citation
 
