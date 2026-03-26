@@ -105,15 +105,15 @@ The tool produces four output files:
 2. **Adaptive Signature Scan** — All nodes in the graph are scanned to identify conversation data candidates. For each node of type `object`, the tool checks whether it possesses the four required properties (`id`, `parentId`, `children`, `message`) by inspecting its outgoing edges. It then verifies the `message → content → parts → elements` path exists to confirm the object contains extractable conversation data. This approach does not depend on any fixed container path (e.g., WeakMap → table), making it resilient to application refactors.
 
 3. **Data Extraction** — For each matched candidate object, the tool traverses multiple paths to extract conversation artifacts:
-   - **Text content**: `message → content → parts → (n) → text → (n)` with fallback to `parts → (n) → elements` and direct string values
-   - **AI reasoning**: `message → content → text` as AI internal reasoning output
-   - **Author info**: `message → author → role`, `name`, and `author → metadata → real_author`, `source`
-   - **Timestamp**: `message → create_time → value`
-   - **File uploads**: `message → metadata → attachments → (n) → {id, name, height, width, size, source}`
-   - **Image generation**: `message → content → parts → (n) → {height, width, size_bytes}` and `parts → (n) → metadata → dalle → gen_id`, `generation → gen_id`, `sanitized`; plus `message → metadata → image_gen_title`
-   - **Web search results**: `message → metadata → search_result_groups → (n) → {domain, entries → (n) → {title, url, snippet, attribution}}`
-   - **Content references**: `message → metadata → content_references → (n) → {title, url, snippet, attribution}` and `content_references → (n) → items → (n) → {title, url, snippet, attribution}`
-   - **Other metadata**: `message → metadata → model_slug`, `safe_urls`
+   - **Text content**
+   - **AI reasoning**
+   - **Author info**
+   - **Timestamp**
+   - **File uploads**
+   - **Image generation**
+   - **Web search results**
+   - **Content references**
+   - **Other metadata**
 
 4. **Thread Reconstruction** — Extracted messages are grouped into conversation threads by tracing `parentId` and `children` fields. Messages sharing a common root (`client-created-root`) are clustered into the same thread. Within each thread, messages are ordered chronologically by `create_time`, and branching from regenerated responses is preserved.
 
