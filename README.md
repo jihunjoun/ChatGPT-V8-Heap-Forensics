@@ -35,7 +35,18 @@ The benchmark dataset (heap snapshot files) is available for download:
 
 **[Download Dataset](https://drive.google.com/drive/folders/1kcEYWK02I8dhIcrtkD0qhEm7DMOqzhiT?usp=sharing)**
 
-The dataset contains `.heapsnapshot` files collected at different conversation stages (350, 500, and 800 messages) for validating the forensic extraction methodology.
+### Dataset Files
+
+| File | Messages | Active | Deleted | Description |
+| --- | --- | --- | --- | --- |
+| `350msg_active.heapsnapshot` | 350 pairs | 350 | 0 | Intermediate snapshot during dataset construction |
+| `500msg_active.heapsnapshot` | 500 pairs | 500 | 0 | Intermediate snapshot during dataset construction |
+| `800msg_active.heapsnapshot` | 800 pairs | 800 | 0 | Full dataset, pre-deletion snapshot |
+| `800msg_400active_400deleted.heapsnapshot` | 800 pairs | 400 | 400 | Post-deletion snapshot (8 conversations deleted via UI) |
+| `800msg_400active_400deleted_latest.heapsnapshot` | 800 pairs | 400 | 400 | Post-deletion snapshot collected from updated ChatGPT client |
+| `ground_truth.txt` | — | — | — | Independent log of all user prompts and AI responses recorded at generation time, used as baseline for extraction accuracy verification |
+
+All snapshots were collected in a controlled virtual machine environment via the Chrome DevTools Protocol (`HeapProfiler` domain). Each snapshot was captured from a clean VM state to prevent cross-contamination between sessions. The `ground_truth.txt` file serves as the reference baseline: all user inputs and AI responses were independently logged at the time of generation, enabling direct comparison with the tool's extraction output to verify accuracy.
 
 ## Requirements
 
