@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Heap Snapshot Forensics — 단일 실행 진입점 (CLI + GUI)
-- 인자 없이 실행 또는 --gui : GUI 실행
-- .heapsnapshot 경로 지정 : CLI 분석 실행 (결과는 스냅샷과 같은 폴더 또는 두 번째 인자로 출력 폴더 지정)
+Heap Snapshot Forensics — single entry point (CLI + GUI).
+- No arguments or `--gui`: launch GUI.
+- Pass a `.heapsnapshot` path: run CLI analysis (output defaults to the tool directory, or pass a second path for output_dir).
 """
 
 import os
 import sys
 
-# 같은 폴더의 heap_forensics, heap_forensics_gui 를 import 할 수 있도록
+# Ensure sibling modules `heap_forensics` and `heap_forensics_gui` are importable.
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
@@ -40,6 +40,7 @@ def _run_cli():
     print("Done:", result["uuid_only_path"])
     print("Conversation HTML:", result["conversation_path"])
     print("Conversation JSON:", result["conversation_json_path"])
+    print("Forensic summary:", result.get("forensic_summary_path", ""))
     print("(See HTML header for message->content->parts->elements count; 0 = path not in heap or different names)")
 
 

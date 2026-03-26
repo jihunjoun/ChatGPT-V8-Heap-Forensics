@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Heap Snapshot Forensics — GUI application for research use.
-Select a .heapsnapshot file, choose output folder, run analysis, and open HTML reports.
+Select a .heapsnapshot file, run analysis, and open HTML reports (default output: this tool folder).
 """
 
 import os
@@ -18,10 +18,11 @@ except ImportError:
     HAS_CTK = False
 
 # Import analysis engine
-from heap_forensics import run_analysis, generate_structure_report
+from heap_forensics import TOOL_VERSION, generate_structure_report, run_analysis
 
+_TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_TITLE = "Heap Snapshot Forensics"
-APP_VERSION = "1.0"
+APP_VERSION = TOOL_VERSION
 OUTPUT_STRUCTURE = "structure_report.html"
 OUTPUT_THREADS = "conversation_threads.html"
 
@@ -84,10 +85,8 @@ def run_gui_plain_tk():
         )
         if path:
             var_input.set(path)
-            base = os.path.dirname(path)
             name = os.path.splitext(os.path.basename(path))[0]
-            default_out = os.path.join(base, f"result_{name}")
-            var_output.set(default_out)
+            var_output.set(os.path.join(_TOOL_DIR, f"result_{name}"))
 
     ttk.Button(row1, text="Browse...", command=browse_input).pack(side="right")
 
@@ -125,7 +124,7 @@ def run_gui_plain_tk():
             messagebox.showerror("File not found", f"File does not exist:\n{inp}")
             return
         if not out:
-            out = os.path.join(os.path.dirname(inp), "result_output")
+            out = os.path.join(_TOOL_DIR, "result_output")
         os.makedirs(out, exist_ok=True)
         btn_analyze.state(["disabled"])
         var_status.set("Loading snapshot...")
@@ -186,21 +185,14 @@ def run_gui_plain_tk():
     ttk.Label(main, text="Results", style="Header.TLabel").pack(anchor="w", pady=(20, 4))
     result_btns = ttk.Frame(main)
     result_btns.pack(fill="x")
-    btn_struct = ttk.Button(result_btns, text="Structure report", state="disabled")
-    btn_struct.pack(side="left", padx=(0, 8))
     btn_threads = ttk.Button(result_btns, text="Conversation threads", state="disabled")
     btn_threads.pack(side="left", padx=(0, 8))
+    btn_struct = ttk.Button(result_btns, text="Structure report", state="disabled")
+    btn_struct.pack(side="left", padx=(0, 8))
     btn_folder = ttk.Button(result_btns, text="Open folder", state="disabled")
     btn_folder.pack(side="left", padx=(0, 8))
 
-    # About
-    ttk.Separator(main, orient="horizontal").pack(fill="x", pady=(24, 8))
-    ttk.Label(
-        main,
-        text=f"{APP_TITLE} v{APP_VERSION} — Research tool for heap snapshot analysis. "
-        "Output: structure report (HTML) and conversation threads (HTML) with timestamps.",
-        wraplength=560,
-    ).pack(anchor="w")
+    ttk.Label(main, text=f"v{APP_VERSION}").pack(anchor="w", pady=(24, 0))
 
     root.mainloop()
 
@@ -238,9 +230,8 @@ def run_gui_customtkinter():
         )
         if path:
             var_input.set(path)
-            base = os.path.dirname(path)
             name = os.path.splitext(os.path.basename(path))[0]
-            var_output.set(os.path.join(base, f"result_{name}"))
+            var_output.set(os.path.join(_TOOL_DIR, f"result_{name}"))
 
     ctk.CTkButton(row1, text="Browse...", width=100, command=browse_input).pack(side="right")
 
@@ -280,7 +271,7 @@ def run_gui_customtkinter():
             messagebox.showerror("File not found", f"File does not exist:\n{inp}")
             return
         if not out:
-            out = os.path.join(os.path.dirname(inp), "result_output")
+            out = os.path.join(_TOOL_DIR, "result_output")
         os.makedirs(out, exist_ok=True)
         btn_analyze.configure(state="disabled")
         var_status.set("Loading snapshot...")
@@ -340,19 +331,14 @@ def run_gui_customtkinter():
     ctk.CTkLabel(main, text="Results", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(28, 8))
     result_btns = ctk.CTkFrame(main, fg_color="transparent")
     result_btns.pack(fill="x")
-    btn_struct = ctk.CTkButton(result_btns, text="Structure report", state="disabled", width=160)
-    btn_struct.pack(side="left", padx=(0, 8))
     btn_threads = ctk.CTkButton(result_btns, text="Conversation threads", state="disabled", width=160)
     btn_threads.pack(side="left", padx=(0, 8))
+    btn_struct = ctk.CTkButton(result_btns, text="Structure report", state="disabled", width=160)
+    btn_struct.pack(side="left", padx=(0, 8))
     btn_folder = ctk.CTkButton(result_btns, text="Open folder", state="disabled", width=120)
     btn_folder.pack(side="left", padx=(0, 8))
 
-    ctk.CTkLabel(
-        main,
-        text=f"{APP_TITLE} v{APP_VERSION} — Output: structure report and conversation threads (HTML).",
-        text_color="gray",
-        wraplength=560,
-    ).pack(anchor="w", pady=(24, 0))
+    ctk.CTkLabel(main, text=f"v{APP_VERSION}", text_color="gray").pack(anchor="w", pady=(24, 0))
 
     root.mainloop()
 
