@@ -141,9 +141,7 @@ def run_gui_plain_tk():
                 var_status.set("Error.")
                 messagebox.showerror("Analysis failed", res["error"])
                 return
-            var_status.set(
-                f"Done. {res.get('uuid_entries_count', 0)} objects, {res.get('message_path_count', 0)} with message content."
-            )
+            var_status.set("Done.")
             threads_path = res.get("conversation_path")
             if threads_path and os.path.isfile(threads_path):
                 btn_threads.config(state="normal", command=lambda: open_file(threads_path))
@@ -288,9 +286,7 @@ def run_gui_customtkinter():
                 var_status.set("Error.")
                 messagebox.showerror("Analysis failed", res["error"])
                 return
-            var_status.set(
-                f"Done. {res.get('uuid_entries_count', 0)} objects, {res.get('message_path_count', 0)} with message content."
-            )
+            var_status.set("Done.")
             threads_path = res.get("conversation_path")
             if threads_path and os.path.isfile(threads_path):
                 btn_threads.configure(state="normal", command=lambda: open_file(threads_path))

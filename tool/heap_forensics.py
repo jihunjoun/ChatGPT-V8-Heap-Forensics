@@ -2314,8 +2314,7 @@ def generate_html_weakmaps(
         "<title>Structure Report — Heap Snapshot Forensics</title>\n<style>\n"
         + _common_css()
         + "</style>\n</head>\n<body>\n"
-        "<header class=\"report-header\"><h1>Structure Report</h1>\n"
-        f"<p class=\"report-meta\">{len(uuid_entries)} candidate objects · {found_message_path} with message path</p></header>\n"
+        "<header class=\"report-header\"><h1>Structure Report</h1></header>\n"
     )
     with open(uuid_only_path, "w", encoding="utf-8") as f:
         f.write(header_uuid)
@@ -2461,8 +2460,6 @@ def write_forensic_run_summary(
     lines.append(f"Status: {'FAILED' if err else 'SUCCESS'}")
     if err:
         lines.append(f"Error: {err}")
-    lines.append(f"Adaptive candidate objects: {result.get('uuid_entries_count', 0)}")
-    lines.append(f"Objects with message content path: {result.get('message_path_count', 0)}")
     lines.append("")
     lines.append("--- Output directory ---")
     lines.append(od)
