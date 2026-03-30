@@ -45,7 +45,7 @@ The dataset covers two ChatGPT client versions (v5.2 and v5.3) to validate extra
 | `v5.2_800msg_400active_400deleted.heapsnapshot` | v5.2 | 800 pairs | 400 | 400 | Post-deletion snapshot (8 conversations deleted via UI) |
 | `v5.3_800msg_active.heapsnapshot` | v5.3 | 800 pairs | 800 | 0 | Full dataset, pre-deletion snapshot |
 | `v5.3_800msg_400active_400deleted.heapsnapshot` | v5.3 | 800 pairs | 400 | 400 | Post-deletion snapshot (8 conversations deleted via UI) |
-| `v5.3_41msg_multimodal.heapsnapshot` | v5.3 | 41 pairs | — | — | Supplementary snapshot containing image generation, file upload, and web search conversations for metadata artifact validation |
+| `v5.3_40msg_multimodal.heapsnapshot` | v5.3 | 40 pairs | — | — | Supplementary snapshot containing image generation, file upload, and web search conversations for metadata artifact validation |
 
 ### Ground-Truth Files
 
@@ -59,7 +59,7 @@ The dataset covers two ChatGPT client versions (v5.2 and v5.3) to validate extra
 
 ### Dataset Description
  
-The primary dataset (text-based conversations) validates extraction accuracy for message content, author roles, timestamps, and thread reconstruction. Each client version includes 800 message pairs (400 active + 400 deleted) totaling 1,600 text-based data points across both versions. The v5.3 dataset additionally includes 41 multimodal message pairs across four scenario categories (image generation, file upload, web search, and content references) for metadata artifact validation, bringing the overall dataset to 1,641 data points.
+The primary dataset (text-based conversations) validates extraction accuracy for message content, author roles, timestamps, and thread reconstruction. Each client version includes 800 message pairs (400 active + 400 deleted) totaling 1,600 text-based data points across both versions. The v5.3 dataset additionally includes 40 multimodal message pairs across four scenario categories (image generation, file upload, web search, and content references) for metadata artifact validation, bringing the overall dataset to 1,640 data points.
  
 All snapshots were collected in a controlled virtual machine environment via the Chrome DevTools Protocol (`HeapProfiler` domain). Each snapshot was captured from a clean VM state to prevent cross-contamination between sessions. The ground-truth files contain independently logged records of all user inputs and AI responses at the time of generation, serving as the reference baseline for verifying extraction accuracy.
 
