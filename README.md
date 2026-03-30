@@ -99,7 +99,7 @@ The tool produces four output files:
 1. **Conversation Threads Report** (`conversation_threads.html`) — Reconstructed conversations in messenger-style format organized by thread UUID
 2. **Conversation Threads JSON** (`conversation_threads.json`) — Machine-readable export of all extracted conversations with metadata
 3. **Structure Report** (`structure_report.html`) — Full object hierarchy of each extracted entry with conversation content, organized by conversation thread
-4. **Forensic Run Summary** (`forensic_run_summary.txt`) — SHA-256/MD5 hashes of the input snapshot, system information, analysis timestamp, tool version, and extraction statistics
+4. **Forensic Run Summary** (`forensic_run_summary.txt`) — SHA-256/MD5 hashes of the input snapshot, system information, analysis timestamp, and tool version
 
 ## How It Works
 
