@@ -35,28 +35,31 @@ The benchmark dataset (heap snapshot files and ground-truth logs) is available f
 
 **[Download Dataset](https://drive.google.com/drive/folders/1kcEYWK02I8dhIcrtkD0qhEm7DMOqzhiT?usp=sharing)**
 
+The dataset covers two ChatGPT client versions (v5.2 and v5.3) to validate extraction resilience across application updates.
+
 ### Heap Snapshot Files
 
-| File | Total Messages | Active | Deleted | Description |
-| --- | --- | --- | --- | --- |
-| `350msg_active.heapsnapshot` | 350 pairs | 350 | 0 | Intermediate snapshot during dataset construction |
-| `500msg_active.heapsnapshot` | 500 pairs | 500 | 0 | Intermediate snapshot during dataset construction |
-| `800msg_active.heapsnapshot` | 800 pairs | 800 | 0 | Full dataset, pre-deletion snapshot |
-| `800msg_400active_400deleted.heapsnapshot` | 800 pairs | 400 | 400 | Post-deletion snapshot (8 conversations deleted via UI) |
-| `800msg_400active_400deleted_latest.heapsnapshot` | 800 pairs | 400 | 400 | Post-deletion snapshot collected from the latest ChatGPT client |
-| `multimodal_scenarios.heapsnapshot` | — | — | — | Supplementary snapshot containing image generation, file upload, and web search conversations for metadata artifact validation |
+| File | Version | Total Messages | Active | Deleted | Description |
+| --- | --- | --- | --- | --- | --- |
+| `v5.2_800msg_active.heapsnapshot` | v5.2 | 800 pairs | 800 | 0 | Full dataset, pre-deletion snapshot |
+| `v5.2_800msg_400active_400deleted.heapsnapshot` | v5.2 | 800 pairs | 400 | 400 | Post-deletion snapshot (8 conversations deleted via UI) |
+| `v5.3_800msg_active.heapsnapshot` | v5.3 | 800 pairs | 800 | 0 | Full dataset, pre-deletion snapshot |
+| `v5.3_800msg_400active_400deleted.heapsnapshot` | v5.3 | 800 pairs | 400 | 400 | Post-deletion snapshot (8 conversations deleted via UI) |
+| `v5.3_multimodal_40scenarios.heapsnapshot` | v5.3 | 40 scenarios | — | — | Supplementary snapshot containing image generation, file upload, and web search conversations for metadata artifact validation |
 
 ### Ground-Truth Files
 
-| File | Corresponds To | Description |
+| File | Version | Description |
 | --- | --- | --- |
-| `ground_truth_800msg.txt` | `800msg_400active_400deleted.heapsnapshot` | Independent log of all user prompts and AI responses recorded at generation time |
-| `ground_truth_800msg_latest.txt` | `800msg_400active_400deleted_latest.heapsnapshot` | Ground-truth log for the latest ChatGPT client dataset |
-| `ground_truth_multimodal_scenarios.heapsnapshot.txt` | `multimodal_scenarios.heapsnapshot` | Ground-truth log for metadata artifact scenarios including image generation parameters, uploaded file details, and web search results |
+| `v5.2_ground_truth_400active.txt` | v5.2 | Ground-truth log for the 400 active conversations |
+| `v5.2_ground_truth_400deleted.txt` | v5.2 | Ground-truth log for the 400 deleted conversations |
+| `v5.3_ground_truth_400active.txt` | v5.3 | Ground-truth log for the 400 active conversations |
+| `v5.3_ground_truth_400deleted.txt` | v5.3 | Ground-truth log for the 400 deleted conversations |
+| `v5.3_ground_truth_multimodal.txt` | v5.3 | Ground-truth log for metadata artifact scenarios including image generation parameters, uploaded file details, and web search results |
 
 ### Dataset Description
 
-The primary dataset (text-based conversations) validates extraction accuracy for message content, author roles, timestamps, and thread reconstruction.
+The primary dataset (text-based conversations) validates extraction accuracy for message content, author roles, timestamps, and thread reconstruction. Each client version includes 800 message pairs (400 active + 400 deleted) totaling 1,600 text-based data points across both versions. The v5.3 dataset additionally includes 40 multimodal scenarios (image generation, file upload, and web search) for metadata artifact validation, bringing the overall dataset to 1,640 data points.
 
 All snapshots were collected in a controlled virtual machine environment via the Chrome DevTools Protocol (`HeapProfiler` domain). Each snapshot was captured from a clean VM state to prevent cross-contamination between sessions. The ground-truth files contain independently logged records of all user inputs and AI responses at the time of generation, serving as the reference baseline for verifying extraction accuracy.
 
